@@ -143,13 +143,20 @@ module.exports = (db) => {
       return res.status(400).json({ error: 'Amount must be between 10,000 and 50,000,000' });
     }
 
-    // ✅ FIX: Validate user exists in Firestore (chống spam tạo topup với userId giả)
-    const userDoc = await db.get('users', userId);
-    if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
-
-    // ✅ FIX: Verify userEmail matches the user document
-    if (userDoc.data().email !== userEmail) {
-      return res.status(403).json({ error: 'User email mismatch' });
+    // Validate user exists (cảnh báo nếu không có doc, vẫn cho tạo QR)
+    try {
+      const userDoc = await db.get('users', userId);
+      if (userDoc.exists) {
+        const storedEmail = userDoc.data().email;
+        // Nếu email không khớp → từ chối (chống giả mạo userId người khác)
+        if (storedEmail && storedEmail !== decodeURIComponent(userEmail)) {
+          return res.status(403).json({ error: 'Thông tin không hợp lệ. Vui lòng đăng nhập lại.' });
+        }
+      }
+      // Nếu user doc chưa có (race condition sau đăng ký) → vẫn cho tạo QR
+    } catch (e) {
+      console.warn('⚠️ Không thể verify user:', userId, e.message);
+      // Tiếp tục tạo QR, không block
     }
 
     const content = `NAP ${(userEmail.split('@')[0] || userId.slice(0, 8)).toUpperCase()}`;
