@@ -1,0 +1,17 @@
+{
+  "name": "gamestore-server",
+  "version": "1.0.0",
+  "description": "GameStore VN Backend - SePay + VietQR (no Service Account needed)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "engines": { "node": "18" },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  }
+}
