@@ -37,6 +37,8 @@ API Key này là public key, an toàn để dùng phía server.
 | BANK_BIN              | 970418                                                             |
 | BANK_ACCOUNT_NUMBER   | 1290702118                                                         |
 | BANK_ACCOUNT_NAME     | NGUYEN NAM SON                                                     |
+| SEPAY_BANK_ACCOUNT_ID | _(xem hướng dẫn bên dưới)_                                        |
+| SKIP_IP_CHECK         | false                                                              |
 
 6. Bấm "Create Web Service" → chờ 3 phút
 
@@ -46,6 +48,29 @@ API Key này là public key, an toàn để dùng phía server.
 
 Render cấp URL dạng: https://gamestore-server-xxxx.onrender.com
 → Vào Environment → Sửa SERVER_URL thành URL đó → Save
+
+---
+
+## Bước 3b: Lấy SEPAY_BANK_ACCOUNT_ID (quan trọng cho VA QR)
+
+Đây là ID tài khoản BIDV trong hệ thống SePay — không phải số tài khoản ngân hàng.
+
+**Cách lấy (2 cách):**
+
+**Cách 1 - Qua giao diện SePay:**
+1. Vào https://my.sepay.vn → đăng nhập
+2. Menu trái → Ngân hàng → chọn tài khoản BIDV
+3. URL trên trình duyệt sẽ có dạng: 
+4. Số  chính là SEPAY_BANK_ACCOUNT_ID
+
+**Cách 2 - Qua API:**
+Gọi: 
+Header: 
+Response trả về list tài khoản, lấy trường uid=0(root) gid=0(root) groups=0(root) của tài khoản BIDV.
+
+**Nếu không điền SEPAY_BANK_ACCOUNT_ID:**
+→ App vẫn chạy được nhưng dùng QR tĩnh
+→ SePay **không tự động** match giao dịch → phải nhập đúng nội dung CK mới cộng tiền
 
 ---
 

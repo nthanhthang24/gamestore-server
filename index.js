@@ -31,6 +31,20 @@ app.get('/', (req, res) => {
   res.json({ status: 'GameStore VN Server ✅', time: new Date().toISOString() });
 });
 
+// ── Debug endpoint (tạm thời) ─────────────────────────────────────────────
+// Gọi: GET /debug/env để kiểm tra env vars đã load chưa
+app.get('/debug/env', (req, res) => {
+  res.json({
+    BANK_VA_NUMBER:        process.env.BANK_VA_NUMBER     || '❌ CHƯA SET',
+    BANK_ACCOUNT_NUMBER:   process.env.BANK_ACCOUNT_NUMBER|| '❌ CHƯA SET',
+    BANK_BIN:              process.env.BANK_BIN           || '❌ CHƯA SET',
+    SEPAY_API_KEY:         process.env.SEPAY_API_KEY ? '✅ SET (hidden)' : '❌ CHƯA SET',
+    SKIP_IP_CHECK:         process.env.SKIP_IP_CHECK      || 'false',
+    FRONTEND_URL:          process.env.FRONTEND_URL        || '❌ CHƯA SET',
+    NODE_ENV:              process.env.NODE_ENV            || 'not set',
+  });
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ Server chạy port ${PORT}`);
