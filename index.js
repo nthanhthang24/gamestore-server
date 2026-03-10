@@ -31,8 +31,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'GameStore VN Server ✅', time: new Date().toISOString() });
 });
 
-// ── Debug endpoint (tạm thời) ─────────────────────────────────────────────
-// Gọi: GET /debug/env để kiểm tra env vars đã load chưa
+// ── Debug endpoints (tạm thời) ───────────────────────────────────────────
 app.get('/debug/env', (req, res) => {
   res.json({
     BANK_VA_NUMBER:        process.env.BANK_VA_NUMBER     || '❌ CHƯA SET',
@@ -43,6 +42,46 @@ app.get('/debug/env', (req, res) => {
     FRONTEND_URL:          process.env.FRONTEND_URL        || '❌ CHƯA SET',
     NODE_ENV:              process.env.NODE_ENV            || 'not set',
   });
+});
+
+// Test Firestore write trực tiếp
+app.get('/debug/firestore', async (req, res) => {
+  const db = require('./lib/firestore');
+  const results = {};
+
+  // Test 1: đọc collection users (bất kỳ doc nào)
+  try {
+    const r = await db.query('users', [], null, 1);
+    results.read_users = r.length > 0 ? '✅ OK' : '✅ OK (empty)';
+  } catch(e) {
+    results.read_users = '❌ ' + (e.response?.status || e.message) + ' ' + JSON.stringify(e.response?.data);
+  }
+
+  // Test 2: tạo topup doc
+  try {
+    const ref = await db.add('topups', {
+      userId: 'debug-test',
+      userEmail: 'debug@test.com',
+      amount: 10000,
+      status: 'pending',
+      createdAt: db.FieldValue.serverTimestamp(),
+    });
+    results.write_topup = '✅ OK id=' + ref.id;
+    // Xóa luôn
+    try { await db.update('topups', ref.id, { status: 'debug-delete' }); } catch(_){}
+  } catch(e) {
+    results.write_topup = '❌ HTTP ' + (e.response?.status || e.code) + ' → ' + JSON.stringify(e.response?.data?.error || e.message);
+  }
+
+  // Test 3: đọc topups
+  try {
+    const r = await db.query('topups', [], null, 1);
+    results.read_topups = '✅ OK';
+  } catch(e) {
+    results.read_topups = '❌ ' + (e.response?.status || e.message);
+  }
+
+  res.json(results);
 });
 
 const PORT = process.env.PORT || 3001;

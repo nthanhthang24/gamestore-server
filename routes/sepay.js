@@ -266,6 +266,8 @@ module.exports = (db) => {
       const decodedEmail = decodeURIComponent(userEmail);
 
       // Bước 1: Tạo topup doc trước → lấy Firestore ID làm mã đối chiếu
+      // Note: Firestore rules phải cho phép server tạo topups
+      // rules: match /topups/{id} { allow create: if true; } (server dùng API key)
       const topupRef = await db.add('topups', {
         userId,
         userEmail:  decodedEmail,
