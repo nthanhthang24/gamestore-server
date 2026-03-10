@@ -268,22 +268,24 @@ module.exports = (db) => {
       // Bước 1: Tạo topup doc trước → lấy Firestore ID làm mã đối chiếu
       // Note: Firestore rules phải cho phép server tạo topups
       // rules: match /topups/{id} { allow create: if true; } (server dùng API key)
-      const topupRef = await db.add('topups', {
+      // Bước 1b: Tạo ID trước bằng cách dùng set() với ID tự sinh
+      // Tạo topupId ngẫu nhiên để dùng làm nội dung CK TRƯỚC khi tạo doc
+      const topupId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+      // Bước 2: Nội dung CK = "NAP <topupId>"
+      const content = `NAP ${topupId}`;
+
+      // Tạo topup doc với transferContent ngay từ đầu (1 lần write, không cần update)
+      // → tránh lỗi 403 khi server update (rules chỉ cho admin update)
+      await db.set('topups', topupId, {
         userId,
         userEmail:  decodedEmail,
         amount:     amt,
         method:     'bank_transfer',
         status:     'pending',
+        transferContent: content,
         createdAt:  db.FieldValue.serverTimestamp(),
       });
-      const topupId = topupRef.id; // VD: "Xk9mR2pQwL3nVbTy"
-
-      // Bước 2: Nội dung CK = "NAP <topupId>"
-      // SePay sẽ gửi lại đúng nội dung này trong webhook → server match chính xác
-      const content = `NAP ${topupId}`;
-
-      // Update topup doc với transferContent
-      await db.update('topups', topupId, { transferContent: content });
 
       // Bước 3: Tạo QR URL
       // ⚡ ROOT CAUSE FIX: Phải dùng SỐ VA thay vì STK BIDV gốc!
