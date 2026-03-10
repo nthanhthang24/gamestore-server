@@ -3,7 +3,22 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ origin: '*' }));
+// ✅ FIX: Restrict CORS to frontend domain only
+// ✅ FIX BUG 19: Always include localhost for dev, production domains from env
+const prodOrigins = (process.env.FRONTEND_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+const devOrigins = ['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000'];
+const allowedOrigins = [...new Set([...prodOrigins, ...devOrigins])];
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow no-origin (Postman, curl, server-to-server) and allowed origins
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error('CORS: origin not allowed - ' + origin));
+  },
+  credentials: true,
+}));
+
+// ✅ FIX: Trust proxy correctly for Render.com (1 hop)
+app.set('trust proxy', 1);
 app.use(express.json());
 
 // Dùng Firestore REST API thay vì firebase-admin
