@@ -105,11 +105,18 @@ module.exports = (db) => {
         return res.status(200).json({ message: 'Amount over limit' });
       }
 
-      // Chống duplicate
-      const existing = await db.query('transactions', [['sePayId', '==', String(sePayId)]], null, 1);
-      if (existing.length > 0) {
-        console.log('⚠️ Duplicate sePayId:', sePayId);
-        return res.status(200).json({ message: 'Already processed' });
+      // Chống duplicate - dùng sePayId lưu trong collection riêng (server có quyền write)
+      // Không query transactions vì server không có auth token
+      // Thay vào đó: check processed_webhooks collection (allow write: if true)
+      try {
+        const dupDoc = await db.get('processedWebhooks', String(sePayId));
+        if (dupDoc.exists) {
+          console.log('⚠️ Duplicate sePayId:', sePayId);
+          return res.status(200).json({ message: 'Already processed' });
+        }
+      } catch(e) {
+        // Nếu không đọc được → tiếp tục xử lý (sẽ có idempotency qua topup status)
+        console.warn('⚠️ Không check duplicate được:', e.message);
       }
 
       // ── Match user ──────────────────────────────────────────────────
@@ -218,6 +225,14 @@ module.exports = (db) => {
           createdAt:       db.FieldValue.serverTimestamp(),
         }));
       }
+
+      // Ghi nhận sePayId để chống duplicate lần sau
+      ops.push(db.set('processedWebhooks', String(sePayId), {
+        sePayId: String(sePayId),
+        userId: user.userId,
+        amount: transferAmount,
+        processedAt: db.FieldValue.serverTimestamp(),
+      }));
 
       await Promise.all(ops);
       console.log(`✅ Nạp +${transferAmount}đ cho ${user.userEmail} | ${prev} → ${next}`);
