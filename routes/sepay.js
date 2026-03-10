@@ -14,9 +14,13 @@
 const express = require('express');
 
 const SEPAY_IPS = [
+  // SePay official IPs
   '103.255.238.108', '103.255.238.109', '103.255.238.110',
   '116.103.227.99',  '42.118.118.53',
-  '127.0.0.1', '::1',
+  // Thêm IP backup (Render có thể nhận IP qua proxy)
+  '103.255.238.0',
+  // Local/test
+  '127.0.0.1', '::1', '::ffff:127.0.0.1',
 ];
 
 module.exports = (db) => {
@@ -36,14 +40,18 @@ module.exports = (db) => {
   function verifyWebhook(req, res, next) {
     const apiKey   = process.env.SEPAY_API_KEY;
     const received = (req.headers['authorization'] || '').replace(/^Apikey\s+/i, '').trim();
+    const ip = getIP(req);
+
+    // Log mọi webhook request để debug
+    console.log(`📬 Webhook arrived | IP: ${ip} | Auth: ${received ? received.slice(0,8)+'...' : 'NONE'}`);
+
     if (apiKey && received !== apiKey) {
-      console.warn(`⛔ Webhook từ chối: API Key sai | IP: ${getIP(req)}`);
+      console.warn(`⛔ Webhook từ chối: API Key sai | IP: ${ip}`);
       return res.status(401).json({ error: 'Unauthorized' });
     }
     if (process.env.SKIP_IP_CHECK !== 'true') {
-      const ip = getIP(req);
       if (!SEPAY_IPS.includes(ip)) {
-        console.warn(`⛔ Webhook từ chối: IP không hợp lệ: ${ip}`);
+        console.warn(`⛔ Webhook từ chối: IP không hợp lệ: ${ip} | Thêm IP này vào SEPAY_IPS hoặc set SKIP_IP_CHECK=true`);
         return res.status(403).json({ error: 'Forbidden' });
       }
     }
