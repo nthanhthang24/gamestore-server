@@ -1,6 +1,6 @@
 {
   "name": "gamestore-server",
-  "version": "1.0.0",
+  "version": "1.3.0-sprint13",
   "description": "GameStore VN Backend - SePay + VietQR (no Service Account needed)",
   "main": "index.js",
   "scripts": {
