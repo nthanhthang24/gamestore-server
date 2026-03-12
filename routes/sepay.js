@@ -296,6 +296,16 @@ module.exports = (db) => {
 
       await Promise.all(ops);
       console.log(`✅ Nạp +${transferAmount}đ cho ${user.userEmail} | ${prev} → ${next}`);
+
+      // ── Referral commission (2% of first topup, configurable) ───────
+      // Only triggers on first-ever topup ≥ minTopup threshold
+      try {
+        await processReferralCommission(db, user.userId, transferAmount);
+      } catch (refErr) {
+        // Non-critical — log and continue, don't fail the webhook
+        console.warn('⚠️ Referral commission error (non-critical):', refErr.message);
+      }
+
       return res.status(200).json({ message: 'success' });
 
     } catch (err) {
@@ -303,6 +313,118 @@ module.exports = (db) => {
       return res.status(500).json({ error: 'Internal server error' });
     }
   });
+
+  // ── Referral Commission Processor ───────────────────────────────────
+  // Reads config from settings/global, triggers only on first qualifying topup
+  async function processReferralCommission(db, userId, topupAmount) {
+    // 1. Read referral config from Firestore settings/global
+    let commissionPct  = 2;     // default 2%
+    let minTopup       = 50000; // default 50,000đ
+    let newUserBonus   = 10000; // default 10,000đ
+    try {
+      const settingsDoc = await db.get('settings', 'global');
+      if (settingsDoc.exists) {
+        const s = settingsDoc.data();
+        if (s.referralCommissionPct != null) commissionPct  = Number(s.referralCommissionPct);
+        if (s.referralMinTopup      != null) minTopup       = Number(s.referralMinTopup);
+        if (s.referralNewUserBonus  != null) newUserBonus   = Number(s.referralNewUserBonus);
+      }
+    } catch(e) { console.warn('Could not read referral config, using defaults:', e.message); }
+
+    // 2. Only process if topup meets minimum threshold
+    if (topupAmount < minTopup) {
+      console.log(`ℹ️ Referral skip: topup ${topupAmount}đ < minTopup ${minTopup}đ`);
+      return;
+    }
+
+    // 3. Check if this user already has a credited referral (prevent double-credit)
+    const existingCredited = await db.query('referrals', [
+      ['newUserId', '==', userId],
+      ['credited',  '==', true ],
+    ], null, 1);
+    if (existingCredited && existingCredited.length > 0) {
+      console.log(`ℹ️ Referral already credited for user ${userId}`);
+      return;
+    }
+
+    // 4. Find uncredited referral for this user
+    const pendingReferrals = await db.query('referrals', [
+      ['newUserId', '==', userId],
+      ['credited',  '==', false],
+    ], null, 1);
+    if (!pendingReferrals || pendingReferrals.length === 0) {
+      console.log(`ℹ️ No pending referral for user ${userId}`);
+      return;
+    }
+
+    // 5. Check this is first topup (no previous approved topups)
+    const prevTopups = await db.query('topups', [
+      ['userId', '==', userId],
+      ['status', '==', 'approved'],
+    ], null, 5);
+    // prevTopups includes the current one already committed — so if count > 1, not first topup
+    if (prevTopups && prevTopups.length > 1) {
+      console.log(`ℹ️ Not first topup for user ${userId} (count: ${prevTopups.length})`);
+      return;
+    }
+
+    const referral = pendingReferrals[0];
+    const referrerId = referral.referrerId;
+    if (!referrerId) return;
+
+    // 6. Calculate commission
+    const commissionAmount = Math.round(topupAmount * commissionPct / 100);
+    console.log(`💰 Referral commission: ${commissionAmount}đ (${commissionPct}% of ${topupAmount}đ) → ${referrerId}`);
+
+    // 7. Credit referrer + mark referral credited (atomic-ish via sequential writes)
+    const referrerDoc = await db.get('users', referrerId);
+    if (!referrerDoc.exists) {
+      console.warn('⚠️ Referrer user not found:', referrerId);
+      return;
+    }
+    const referrerBalance = referrerDoc.data().balance || 0;
+
+    await Promise.all([
+      // Credit referrer
+      db.update('users', referrerId, {
+        balance: referrerBalance + commissionAmount,
+        updatedAt: db.FieldValue.serverTimestamp(),
+      }),
+      // Mark referral as credited, store topup info
+      db.update('referrals', referral.id, {
+        credited: true,
+        commissionAmount,
+        commissionPct,
+        topupAmount,
+        creditedAt: db.FieldValue.serverTimestamp(),
+      }),
+      // Transaction record for referrer
+      db.add('transactions', {
+        userId:   referrerId,
+        type:     'referral_commission',
+        amount:   commissionAmount,
+        fromUserId: userId,
+        commissionPct,
+        topupAmount,
+        balanceBefore: referrerBalance,
+        balanceAfter:  referrerBalance + commissionAmount,
+        createdAt: db.FieldValue.serverTimestamp(),
+      }),
+      // In-app notification for referrer
+      db.add('notifications', {
+        title:        '💰 Nhận hoa hồng giới thiệu!',
+        body:         `Bạn bè của bạn vừa nạp ${topupAmount.toLocaleString ? topupAmount.toLocaleString('vi-VN') : topupAmount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}đ. Bạn nhận được ${commissionAmount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}đ (${commissionPct}% hoa hồng).`,
+        type:         'referral',
+        targetAll:    false,
+        targetUserId: referrerId,
+        active:       true,
+        read:         [],
+        createdAt:    db.FieldValue.serverTimestamp(),
+        createdBy:    'system',
+      }),
+    ]);
+    console.log(`✅ Referral commission credited: ${commissionAmount}đ to ${referrerId}`);
+  }
 
   // ── Middleware: verify Firebase ID token ─────────────────────────────
   // FIX VULN-14: /bank/vietqr phải có auth — không ai gọi thay người khác được
