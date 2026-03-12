@@ -12,63 +12,16 @@
 // → Đảm bảo match chính xác 100%, không phụ thuộc vào email format
 
 const express = require('express');
-const crypto  = require('crypto');
-
-// ── IP Whitelist — đọc từ env var để cập nhật KHÔNG CẦN redeploy ────
-// Render dashboard → Environment → SEPAY_IPS = "103.255.238.108,116.103.227.99"
-// Lấy IP mới nhất tại: my.sepay.vn → Tài khoản → Cài đặt webhook → IP cho phép
-const SEPAY_IPS_EXTRA = (process.env.SEPAY_IPS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
 
 const SEPAY_IPS = [
-  // Fallback hardcode — IPs đã biết tại thời điểm deploy
+  // SePay official IPs
   '103.255.238.108', '103.255.238.109', '103.255.238.110',
   '116.103.227.99',  '42.118.118.53',
-  // Local/test only
+  // Thêm IP backup (Render có thể nhận IP qua proxy)
+  '103.255.238.0',
+  // Local/test
   '127.0.0.1', '::1', '::ffff:127.0.0.1',
-  // IPs từ env var (cập nhật không cần redeploy)
-  ...SEPAY_IPS_EXTRA,
 ];
-
-console.log(`🔒 IP whitelist: ${SEPAY_IPS.filter(ip => !ip.startsWith('127') && !ip.startsWith('::')).join(', ')}${SEPAY_IPS_EXTRA.length ? ` (+${SEPAY_IPS_EXTRA.length} từ env)` : ''}`);
-
-// ── IP Verification — Best-Effort Secondary Layer ─────────────────────
-// QUAN TRỌNG: trên Render.com (có Cloudflare edge + internal LB), không có
-// cách 100% reliable để lấy IP gốc của caller:
-//
-//   Request chain: SePay → [Cloudflare] → [Render LB] → App
-//   req.socket.remoteAddress = IP Render internal LB (10.x.x.x), KHÔNG phải SePay
-//   X-Forwarded-For = có thể bị forge bởi attacker
-//   CF-Connecting-IP = Cloudflare thêm, nhưng bypass được nếu gọi origin IP trực tiếp
-//
-// → PRIMARY security = SEPAY_API_KEY (secret, không thể forge)
-// → IP check = secondary best-effort layer (chặn unsophisticated attacks)
-//
-// Chiến lược: đọc X-Forwarded-For NHƯNG chỉ lấy hop ĐẦU TIÊN (leftmost = closest to real origin)
-// và log tất cả để monitoring. Không hard-fail nếu IP không match — chỉ LOG WARN.
-function getCallerIP(req) {
-  const xff    = req.headers['x-forwarded-for'] || '';
-  const cfIP   = req.headers['cf-connecting-ip'] || '';      // Cloudflare edge header
-  const socket = (req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
-
-  // Leftmost XFF entry = IP gần origin nhất (nhưng vẫn có thể forge)
-  const xffFirst = xff.split(',')[0]?.trim().replace(/^::ffff:/, '') || '';
-
-  return {
-    socket,
-    xff:    xffFirst,
-    cf:     cfIP,
-    // Best guess: CF-Connecting-IP nếu có (Cloudflare đảm bảo), fallback XFF leftmost
-    best:   cfIP || xffFirst || socket,
-  };
-}
-
-function isKnownSepayIP(ip) {
-  if (!ip) return false;
-  if (SEPAY_IPS.includes(ip)) return true;
-  if (ip.startsWith('103.255.238.')) return true; // SePay subnet
-  return false;
-}
 
 module.exports = (db) => {
   const router = express.Router();
@@ -84,37 +37,29 @@ module.exports = (db) => {
   };
 
   // ── Middleware bảo mật webhook ────────────────────────────────────────
-  // PRIMARY guard  = SEPAY_API_KEY (secret — hard fail nếu sai)
-  // SECONDARY guard = IP check (best-effort — log warn nếu không match,
-  //                   không hard-fail vì Render proxy layers không reliable)
   function verifyWebhook(req, res, next) {
     const apiKey   = process.env.SEPAY_API_KEY;
     const received = (req.headers['authorization'] || '').replace(/^Apikey\s+/i, '').trim();
-    const ips      = getCallerIP(req);
+    const ip = getIP(req);
 
-    // Log tất cả IP sources để monitoring thực tế trên Render
-    console.log(`📬 Webhook | socket:${ips.socket} xff:${ips.xff} cf:${ips.cf} best:${ips.best} | auth:${received ? received.slice(0,8)+'...' : 'NONE'}`);
+    // Log mọi webhook request để debug
+    console.log(`📬 Webhook arrived | IP: ${ip} | Auth: ${received ? received.slice(0,8)+'...' : 'NONE'}`);
 
-    // PRIMARY: API key check — hard fail
-    if (!apiKey) {
-      console.error('⛔ SEPAY_API_KEY chưa cấu hình — từ chối (fail-closed)');
-      return res.status(503).json({ error: 'Service not configured' });
-    }
-    if (received !== apiKey) {
-      console.warn(`⛔ API Key sai | best_ip:${ips.best}`);
+    if (apiKey && received !== apiKey) {
+      console.warn(`⛔ Webhook từ chối: API Key sai | IP: ${ip}`);
       return res.status(401).json({ error: 'Unauthorized' });
     }
-
-    // SECONDARY: IP check — log warn nhưng không block
-    // (vì trên Render, IP qua nhiều proxy layer → không reliable để hard-fail)
-    if (!isKnownSepayIP(ips.best)) {
-      console.warn(`⚠️  IP lạ nhưng API key đúng: best=${ips.best} socket=${ips.socket} xff=${ips.xff}`);
-      console.warn(`⚠️  Nếu đây là SePay IP mới → thêm vào Render env: SEPAY_IPS=...,${ips.best}`);
-    } else {
-      console.log(`✅ IP match: ${ips.best}`);
+    if (process.env.SKIP_IP_CHECK !== 'true') {
+      if (!SEPAY_IPS.includes(ip)) {
+        console.warn(`⛔ Webhook từ chối: IP không hợp lệ: ${ip} | Thêm IP này vào SEPAY_IPS hoặc set SKIP_IP_CHECK=true`);
+        return res.status(403).json({ error: 'Forbidden' });
+      }
     }
-
     next();
+  }
+
+  function getIP(req) {
+    return req.ip || req.socket?.remoteAddress || '';
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -160,23 +105,18 @@ module.exports = (db) => {
         return res.status(200).json({ message: 'Amount over limit' });
       }
 
-      // ── Atomic duplicate check (FIX VULN-16: race condition) ───────
-      // Attempt to CREATE processedWebhooks/{sePayId} with precondition "must not exist"
-      // Firestore REST PATCH with currentDocument.exists=false is atomic — if two requests
-      // race, only one wins; the other gets HTTP 409 Conflict.
+      // Chống duplicate - dùng sePayId lưu trong collection riêng (server có quyền write)
+      // Không query transactions vì server không có auth token
+      // Thay vào đó: check processed_webhooks collection (allow write: if true)
       try {
-        await db.createIfNotExists('processedWebhooks', String(sePayId), {
-          sePayId: String(sePayId),
-          status: 'processing',
-          startedAt: db.FieldValue.serverTimestamp(),
-        });
-      } catch(e) {
-        if (e.response?.status === 409 || (e.message || '').includes('ALREADY_EXISTS')) {
-          console.log('⚠️ Duplicate sePayId (atomic check):', sePayId);
+        const dupDoc = await db.get('processedWebhooks', String(sePayId));
+        if (dupDoc.exists) {
+          console.log('⚠️ Duplicate sePayId:', sePayId);
           return res.status(200).json({ message: 'Already processed' });
         }
-        // Other errors: continue (idempotency via topup status as backup)
-        console.warn('⚠️ Atomic duplicate check failed, continuing:', e.message);
+      } catch(e) {
+        // Nếu không đọc được → tiếp tục xử lý (sẽ có idempotency qua topup status)
+        console.warn('⚠️ Không check duplicate được:', e.message);
       }
 
       // ── Match user ──────────────────────────────────────────────────
@@ -286,9 +226,9 @@ module.exports = (db) => {
         }));
       }
 
-      // Mark processedWebhooks as fully committed (update from 'processing' → 'done')
-      ops.push(db.update('processedWebhooks', String(sePayId), {
-        status: 'done',
+      // Ghi nhận sePayId để chống duplicate lần sau
+      ops.push(db.set('processedWebhooks', String(sePayId), {
+        sePayId: String(sePayId),
         userId: user.userId,
         amount: transferAmount,
         processedAt: db.FieldValue.serverTimestamp(),
@@ -304,47 +244,14 @@ module.exports = (db) => {
     }
   });
 
-  // ── Middleware: verify Firebase ID token ─────────────────────────────
-  // FIX VULN-14: /bank/vietqr phải có auth — không ai gọi thay người khác được
-  async function verifyFirebaseToken(req, res, next) {
-    const authHeader = req.headers['authorization'] || '';
-    const idToken = authHeader.replace(/^Bearer\s+/i, '').trim();
-    if (!idToken) {
-      return res.status(401).json({ error: 'Missing Authorization token' });
-    }
-    try {
-      // Verify via Firebase REST (no Admin SDK needed)
-      const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
-      if (!FIREBASE_API_KEY) return res.status(503).json({ error: 'Server not configured' });
-      const resp = await require('axios').post(
-        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_API_KEY}`,
-        { idToken }
-      );
-      const users = resp.data?.users;
-      if (!users || users.length === 0) {
-        return res.status(401).json({ error: 'Invalid token' });
-      }
-      req.firebaseUid = users[0].localId;
-      req.firebaseEmail = users[0].email;
-      next();
-    } catch (e) {
-      console.warn('Token verify failed:', e.response?.data || e.message);
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-  }
-
   // ════════════════════════════════════════════════════════════════════
-  // GET /bank/vietqr  ← Frontend gọi để lấy QR (requires auth token)
+  // GET /bank/vietqr  ← Frontend gọi để lấy QR
+  // Nội dung CK: "NAP <topupId>" - topupId là Firestore doc ID ngắn
   // ════════════════════════════════════════════════════════════════════
-  router.get('/vietqr', verifyFirebaseToken, async (req, res) => {
+  router.get('/vietqr', async (req, res) => {
     const { amount, userId, userEmail } = req.query;
     if (!amount || !userId || !userEmail)
       return res.status(400).json({ error: 'Missing params' });
-
-    // FIX VULN-14: userId phải khớp với token đã verify — không cho đặt userId người khác
-    if (userId !== req.firebaseUid) {
-      return res.status(403).json({ error: 'userId không khớp với token. Vui lòng đăng nhập lại.' });
-    }
 
     const amt = Number(amount);
     if (isNaN(amt) || amt < 10000 || amt > 50_000_000)
@@ -386,8 +293,7 @@ module.exports = (db) => {
       // rules: match /topups/{id} { allow create: if true; } (server dùng API key)
       // Bước 1b: Tạo ID trước bằng cách dùng set() với ID tự sinh
       // Tạo topupId ngẫu nhiên để dùng làm nội dung CK TRƯỚC khi tạo doc
-      // FIX VULN-17: CSPRNG topupId — không dùng Math.random() (predictable)
-      const topupId = crypto.randomBytes(12).toString('hex'); // 24-char hex, 96-bit entropy
+      const topupId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 
       // Bước 2: Nội dung CK = "NAP <topupId>"
       const content = `NAP ${topupId}`;
@@ -426,7 +332,7 @@ module.exports = (db) => {
         bankBin:         BANK.bin,
         amount:          amt,
         topupId,
-        method:          BANK.va ? 'va' : 'static', // FIX S-07: 'va' khi dùng VA — không cần nhập nội dung CK
+        method:          'static',
         usingVA:         !!BANK.va,
       });
 
@@ -436,17 +342,41 @@ module.exports = (db) => {
     }
   });
 
-  // ── /bank/test-webhook REMOVED (S-02: security risk) ────────────────
-  // Endpoint này đã bị xóa vĩnh viễn — ALLOW_TEST env bypass nguy hiểm.
-  // Để test webhook, dùng: curl trực tiếp với SEPAY_API_KEY từ máy local.
+  // ── GET /bank/test-webhook ← Để test thủ công ──────────────────────
+  // Gọi: GET /bank/test-webhook?topupId=xxx&amount=50000
+  router.get('/test-webhook', async (req, res) => {
+    if (process.env.NODE_ENV === 'production' && process.env.ALLOW_TEST !== 'true') {
+      return res.status(403).json({ error: 'Disabled in production' });
+    }
+    const { topupId, amount } = req.query;
+    if (!topupId) return res.status(400).json({ error: 'Missing topupId' });
+
+    // Giả lập webhook payload
+    const fakeBody = {
+      id:             99999,
+      gateway:        'BIDV',
+      transactionDate: new Date().toISOString(),
+      content:        `NAP ${topupId}`,
+      transferType:   'in',
+      transferAmount: Number(amount) || 50000,
+      referenceCode:  'TEST001',
+      error:          0,
+    };
+    req.body = fakeBody;
+    console.log('🧪 Test webhook với:', JSON.stringify(fakeBody));
+
+    // Gọi lại handler webhook (bypass auth)
+    req.headers['authorization'] = `Apikey ${process.env.SEPAY_API_KEY}`;
+    process.env.SKIP_IP_CHECK = 'true';
+
+    // Trả về luôn response cho user xem
+    res.json({ message: 'Test initiated, check server logs', payload: fakeBody });
+  });
 
   return router;
 };
 
 // ── Fallback: tìm user theo email prefix ──────────────────────────────────
-// FIX S-03: Removed O(n) full-scan. Only match full email now.
-// topupId match (primary path) handles 99%+ of cases.
-// Email prefix match was legacy from before topupId existed.
 async function findUserByEmail(db, content) {
   const napMatch = content.match(/NAP\s+([^\s]+)/i);
   if (!napMatch) return null;
@@ -454,14 +384,25 @@ async function findUserByEmail(db, content) {
   const id = napMatch[1].toLowerCase().trim();
   if (id.length < 3) return null;
 
-  // Full email match only — no O(n) prefix scan
+  // Email đầy đủ
   if (id.includes('@')) {
     const r = await db.query('users', [['email', '==', id]], null, 1);
     if (r.length > 0) {
       const d = r[0].data();
       return { userId: r[0].id, userEmail: d.email, displayName: d.displayName };
     }
+    return null;
   }
-  // FIX S-03: prefix scan removed — unmatch goes to manual review instead
+
+  // Email prefix
+  const all = await db.query('users', [], null, 2000);
+  const match = all.find(u => {
+    const prefix = (u.data().email || '').toLowerCase().split('@')[0];
+    return prefix === id;
+  });
+  if (match) {
+    const d = match.data();
+    return { userId: match.id, userEmail: d.email, displayName: d.displayName };
+  }
   return null;
 }
