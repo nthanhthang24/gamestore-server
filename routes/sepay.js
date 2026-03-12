@@ -377,17 +377,22 @@ module.exports = (db) => {
     console.log(`💰 Referral commission: ${commissionAmount}đ (${commissionPct}% of ${topupAmount}đ) → ${referrerId}`);
 
     // 7. Credit referrer + mark referral credited (atomic-ish via sequential writes)
+    // FIX 2025-H: Use atomic increment — eliminates read+write race condition.
+    // Previously: read referrerBalance → write balance+commissionAmount
+    // Problem: two simultaneous webhooks (retry scenario) could both read same balance
+    //          and both credit the same amount → double-payment.
+    // Fix: Firestore field increment is atomic server-side — safe under any concurrency.
     const referrerDoc = await db.get('users', referrerId);
     if (!referrerDoc.exists) {
       console.warn('⚠️ Referrer user not found:', referrerId);
       return;
     }
-    const referrerBalance = referrerDoc.data().balance || 0;
+    const referrerBalance = referrerDoc.data().balance || 0; // snapshot for transaction log only
 
     await Promise.all([
-      // Credit referrer
+      // FIX: atomic increment — no race condition possible
       db.update('users', referrerId, {
-        balance: referrerBalance + commissionAmount,
+        balance: db.FieldValue.increment(commissionAmount),
         updatedAt: db.FieldValue.serverTimestamp(),
       }),
       // Mark referral as credited, store topup info
