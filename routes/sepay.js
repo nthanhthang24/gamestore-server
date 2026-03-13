@@ -526,8 +526,11 @@ module.exports = (db) => {
       return res.status(429).json({ error: 'Quá nhiều yêu cầu. Thử lại sau 1 phút.' });
     }
 
+    // Lấy userToken từ request để dùng cho Firestore REST calls
+    const userToken = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+
     try {
-      const orderDoc = await db.get('orders', orderId);
+      const orderDoc = await db.getWithToken('orders', orderId, userToken);
       if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
 
       const order = orderDoc.data();
@@ -629,7 +632,7 @@ module.exports = (db) => {
       const accountDataById = {};
       await Promise.all(uniqueAccountIds.map(async (accountId) => {
         try {
-          const credDoc = await db.get(`accounts/${accountId}/credentials`, 'slots');
+          const credDoc = await db.getWithToken(`accounts/${accountId}/credentials`, 'slots', userToken);
           accountDataById[accountId] = {
             acc:   accountDocsById[accountId], // đã fetch ở price check
             creds: credDoc.exists ? (credDoc.data().slots || []) : [],
@@ -754,7 +757,7 @@ module.exports = (db) => {
       });
 
       // Update order: inject credentials + mark done
-      await db.update('orders', orderId, {
+      await db.updateWithToken('orders', orderId, {
         items:               updatedItems,
         _soldCountUpdated:   true,
         _credentialsInjected: true,

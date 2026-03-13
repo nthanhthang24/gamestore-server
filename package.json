@@ -1,7 +1,7 @@
 {
   "name": "gamestore-server",
   "version": "1.4.0",
-  "description": "GameStore VN Backend - SePay + VietQR (Firebase REST API, no Service Account)",
+  "description": "GameStore VN Backend \u2014 userToken REST API, no service account",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -14,7 +14,6 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "firebase-admin": "^13.7.0",
     "helmet": "^8.1.0",
     "node-fetch": "^3.3.2"
   }
