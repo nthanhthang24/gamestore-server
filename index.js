@@ -37,7 +37,10 @@ const VERCEL_PROJECT_NAMES = (process.env.VERCEL_PROJECT_NAMES || 'gamestore-cli
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // server-to-server (webhook)
+  // SECURITY: null origin (file://, sandboxed iframe) phải bị chặn
+  // Chỉ server-to-server (webhook từ SePay) mới không có origin → nhưng webhook
+  // đi qua /bank/webhook có verifyWebhook middleware riêng (API key) → không cần CORS bypass
+  if (!origin) return false;
   if (allowedOrigins.includes(origin)) return true;
   if (allowedOrigins.length === 0 && process.env.NODE_ENV !== 'production') return true;
   // Allow all Vercel deployments for configured project names

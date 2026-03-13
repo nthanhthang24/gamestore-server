@@ -510,7 +510,7 @@ module.exports = (db) => {
     // FIX V7 + H4: Rate limit theo CẢ userId VÀ orderId
     // - Per orderId: ngăn race condition double-inject (1 req/30s per order)
     // - Per userId: ngăn DoS với nhiều orderId khác nhau (10 req/min per user)
-    if (rateLimit(`checkout:order:${orderId}`, 1, 30_000)) {
+    if (rateLimit(`checkout:order:${orderId}`, 2, 30_000)) { // 2 req/30s: allow 1 retry after Render cold start
       return res.status(429).json({ error: 'Yêu cầu đang được xử lý. Thử lại sau 30 giây.' });
     }
     if (rateLimit(`checkout:user:${req.firebaseUid}`, 10, 60_000)) {
