@@ -404,15 +404,6 @@ module.exports = (db) => {
   // Giải pháp: decode JWT payload (base64), check exp claim, sau đó verify với Firebase.
   const _fetchModule = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
-  function decodeJwtPayload(token) {
-    try {
-      const parts = token.split('.');
-      if (parts.length !== 3) return null;
-      const payload = Buffer.from(parts[1], 'base64url').toString('utf8');
-      return JSON.parse(payload);
-    } catch { return null; }
-  }
-
   async function verifyFirebaseToken(req, res, next) {
     const authHeader = req.headers['authorization'] || '';
     const idToken = authHeader.replace(/^Bearer\s+/i, '').trim();
@@ -420,41 +411,9 @@ module.exports = (db) => {
       return res.status(401).json({ error: 'Missing Authorization token' });
     }
     try {
-      // FIX C1: Check expiry locally first (fast, no network)
-      const payload = decodeJwtPayload(idToken);
-      if (!payload || !payload.exp || !payload.sub) {
-        return res.status(401).json({ error: 'Invalid token format' });
-      }
-      const nowSec = Math.floor(Date.now() / 1000);
-      if (payload.exp < nowSec) {
-        return res.status(401).json({ error: 'Token expired' });
-      }
-      // Also check iat — token should not be issued in future (clock skew >5min)
-      if (payload.iat && payload.iat > nowSec + 300) {
-        return res.status(401).json({ error: 'Token issued in future' });
-      }
-
-      // Verify with Firebase (confirms signature + not revoked)
-      const apiKey = process.env.FIREBASE_API_KEY;
-      const verifyRes = await _fetchModule(
-        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idToken }),
-        }
-      );
-      const data = await verifyRes.json();
-      if (!verifyRes.ok || !data.users || data.users.length === 0) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
-      }
-      const user = data.users[0];
-      // Cross-check uid from JWT payload vs Firebase response
-      if (user.localId !== payload.sub) {
-        return res.status(401).json({ error: 'Token uid mismatch' });
-      }
-      req.firebaseUid   = user.localId;
-      req.firebaseEmail = user.email;
+      const decoded = await db.verifyIdToken(idToken);
+      req.firebaseUid   = decoded.uid;
+      req.firebaseEmail = decoded.email || '';
       next();
     } catch (e) {
       console.warn('Token verify failed:', e.message);
