@@ -206,9 +206,10 @@ module.exports = (db) => {
         console.error('❌ User không tìm thấy:', user.userId);
         return res.status(404).json({ error: 'User not found' });
       }
-      const prev = userDoc.data().balance || 0;
-      const next = prev + safeAmount;
 
+      // FIX: Không đọc balance trước khi increment để tránh race condition trong log.
+      // balanceBefore/After = -1 nghĩa là "not tracked" (tránh 2 webhook song song ghi sai log).
+      // Balance thực tế luôn đúng vì dùng atomic increment().
       const writePromises = [
         db.update('users', user.userId, {
           balance:   db.FieldValue.increment(safeAmount),
@@ -221,8 +222,8 @@ module.exports = (db) => {
           method:        'bank_transfer',
           gateway,
           amount:        safeAmount,
-          balanceBefore: prev,
-          balanceAfter:  next,
+          balanceBefore: -1, // not tracked — use increment() to avoid race condition in log
+          balanceAfter:  -1,
           sePayId:       String(sePayId),
           referenceCode,
           content,
@@ -266,7 +267,7 @@ module.exports = (db) => {
       }, serverToken));
 
       await Promise.all(writePromises);
-      console.log(`✅ Nạp +${safeAmount}đ cho ${user.userEmail} | ${prev} → ${next}`);
+      console.log(`✅ Nạp +${safeAmount}đ cho ${user.userEmail}`);
 
       try {
         await processReferralCommission(db, user.userId, safeAmount, serverToken);
@@ -301,11 +302,45 @@ module.exports = (db) => {
 
     const lockKey = `referral_lock_${userId}`;
     try {
-      await db.createIfNotExists('processedWebhooks', lockKey, {
-        type:      'referral_lock',
-        userId,
-        lockedAt:  db.FieldValue.serverTimestamp(),
-      }, serverToken);
+      // FIX: Kiểm tra lock có quá 5 phút không (stuck lock sau crash) trước khi tạo mới
+      try {
+        const existingLock = await db.get('processedWebhooks', lockKey, serverToken);
+        if (existingLock.exists) {
+          const lockData = existingLock.data();
+          if (lockData.status === 'done') {
+            // Lock đã done → referral đã xử lý xong → skip
+            console.log(`⚠️ Referral commission lock already done for userId=${userId}`);
+            return;
+          }
+          // Lock đang processing: check xem có stuck không (> 5 phút)
+          const lockedAt = lockData.lockedAt ? new Date(lockData.lockedAt) : null;
+          const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+          if (lockedAt && lockedAt > fiveMinutesAgo) {
+            console.log(`⚠️ Referral commission in-progress for userId=${userId}, skipping`);
+            return;
+          }
+          // Lock cũ hơn 5 phút → có thể stuck, ghi đè để retry
+          console.log(`🔄 Overwriting stale referral lock for userId=${userId}`);
+          await db.update('processedWebhooks', lockKey, {
+            type: 'referral_lock', userId,
+            lockedAt: db.FieldValue.serverTimestamp(),
+            status: 'processing',
+          }, serverToken);
+        } else {
+          // Lock chưa tồn tại → tạo mới
+          await db.createIfNotExists('processedWebhooks', lockKey, {
+            type: 'referral_lock', userId,
+            lockedAt: db.FieldValue.serverTimestamp(),
+            status: 'processing',
+          }, serverToken);
+        }
+      } catch (lockErr) {
+        if (lockErr.message === 'ALREADY_EXISTS' || lockErr.response?.status === 409) {
+          console.log(`⚠️ Referral commission race — concurrent request for userId=${userId}`);
+          return;
+        }
+        throw lockErr;
+      }
     } catch (lockErr) {
       if (lockErr.message === 'ALREADY_EXISTS' || lockErr.response?.status === 409) {
         console.log(`⚠️ Referral commission already being processed for userId=${userId}`);
@@ -557,12 +592,13 @@ module.exports = (db) => {
         return res.status(400).json({ error: 'Order has no items' });
       }
 
-      // ── Verify order total matches real DB prices ─────────────────────────
+      // ── Verify order total: server recalculates from DB (authoritative) ──────
+      // SECURITY: Server tự tính expectedTotal từ DB thay vì dùng threshold %.
+      // Bao gồm flash sale (server fetch), bulk discount, voucher → so sánh ±1đ.
       const uniqueAccountIds = [...new Set(items.map(i => i.id).filter(Boolean))];
       const accountDocsById = {};
       await Promise.all(uniqueAccountIds.map(async (accountId) => {
         try {
-          // accounts là public read — không cần token
           const accDoc = await db.get('accounts', accountId);
           accountDocsById[accountId] = accDoc.exists ? accDoc.data() : null;
         } catch (e) {
@@ -571,27 +607,101 @@ module.exports = (db) => {
         }
       }));
 
-      let dbPriceSum = 0;
       for (const item of items) {
-        const accData = accountDocsById[item.id];
-        if (!accData) {
-          console.warn(`⚠️ Account ${item.id} not in DB — aborting credential injection`);
+        if (!accountDocsById[item.id]) {
+          console.warn(`⚠️ Account ${item.id} not in DB — aborting`);
           return res.status(400).json({ error: `Account ${item.id} không tồn tại` });
         }
-        dbPriceSum += accData.price || 0;
       }
 
+      // Fetch active flash sale from DB (không tin client)
+      let activeFlashSale = null;
+      try {
+        const fsSnap = await db.query('flashSales', [['active', '==', true]], null, 5, null);
+        const now = new Date();
+        activeFlashSale = fsSnap.find(doc => {
+          const d = doc.data();
+          const start = d.startAt ? new Date(d.startAt) : null;
+          const end   = d.endAt   ? new Date(d.endAt)   : null;
+          if (start && now < start) return false;
+          if (end   && now > end)   return false;
+          return true;
+        })?.data() || null;
+      } catch (e) {
+        console.warn('⚠️ Could not fetch flash sales, using base prices:', e.message);
+      }
+
+      // Tính expectedSubtotal (kể cả flash sale per-gameType)
+      let expectedSubtotal = 0;
+      for (const item of items) {
+        const accData = accountDocsById[item.id];
+        const dbPrice = accData.price || 0;
+        let effectivePrice = dbPrice;
+        if (activeFlashSale) {
+          const gameType = accData.gameType || item.gameType || '';
+          const appliesTo = activeFlashSale.targetAll ||
+            !activeFlashSale.targetGameTypes?.length ||
+            (gameType && (activeFlashSale.targetGameTypes || []).includes(gameType));
+          if (appliesTo) {
+            const discount = Math.min(Math.max(0, activeFlashSale.discount || 0), 99);
+            effectivePrice = Math.round(dbPrice * (1 - discount / 100));
+          }
+        }
+        expectedSubtotal += effectivePrice;
+      }
+
+      // Fetch bulk discount rules từ DB
+      let expectedBulkDiscount = 0;
+      try {
+        const bdSnap = await db.query('bulkDiscountRules', [['active', '==', true]], null, 20, serverToken);
+        const applicable = bdSnap.filter(d => items.length >= (d.data().minQty || 0));
+        if (applicable.length > 0) {
+          const best = applicable.reduce((a, b) =>
+            (a.data().minQty || 0) > (b.data().minQty || 0) ? a : b);
+          const pct = best.data().discountPct || 0;
+          expectedBulkDiscount = Math.round(expectedSubtotal * pct / 100);
+        }
+      } catch (e) {
+        console.warn('⚠️ Could not fetch bulk discount rules:', e.message);
+      }
+
+      // Fetch và verify voucher từ DB nếu order có voucherCode
+      let expectedVoucherDiscount = 0;
+      const voucherCode = order.voucherCode;
+      if (voucherCode) {
+        try {
+          const vSnap = await db.query('vouchers', [
+            ['code',   '==', String(voucherCode).toUpperCase()],
+            ['active', '==', true],
+          ], null, 1, serverToken);
+          if (vSnap.length > 0) {
+            const vData = vSnap[0].data();
+            const afterBulk = expectedSubtotal - expectedBulkDiscount;
+            if (vData.type === 'fixed') {
+              expectedVoucherDiscount = Math.min(vData.value || 0, afterBulk);
+            } else {
+              const raw = (afterBulk * (vData.value || 0)) / 100;
+              expectedVoucherDiscount = vData.maxDiscount > 0
+                ? Math.min(raw, vData.maxDiscount) : raw;
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Could not verify voucher:', e.message);
+        }
+      }
+
+      // So sánh server-expected vs client-submitted (tolerance ±1đ làm tròn float)
+      const expectedTotal = Math.round(Math.max(0,
+        expectedSubtotal - expectedBulkDiscount - expectedVoucherDiscount));
       const orderTotal = order.total || 0;
-      const minAllowedTotal = Math.floor(dbPriceSum * 0.10);
-      const strictMinAllowedTotal = Math.floor(dbPriceSum * 0.25);
-      const effectiveMin = Math.max(minAllowedTotal, strictMinAllowedTotal > 0 ? strictMinAllowedTotal : 0);
-      if (orderTotal < effectiveMin || orderTotal <= 0) {
-        console.error(`⛔ Price manipulation detected! orderId=${orderId} total=${orderTotal} dbPriceSum=${dbPriceSum} minAllowed=${effectiveMin}`);
+      if (Math.abs(orderTotal - expectedTotal) > 1 || orderTotal <= 0) {
+        console.error(`⛔ Price mismatch! orderId=${orderId} clientTotal=${orderTotal} serverExpected=${expectedTotal} (sub=${expectedSubtotal} bulk=${expectedBulkDiscount} voucher=${Math.round(expectedVoucherDiscount)})`);
         return res.status(403).json({
           error: 'Tổng đơn hàng không hợp lệ. Vui lòng đặt hàng lại.',
           code:  'PRICE_MISMATCH',
         });
       }
+      console.log(`✅ Price verified: clientTotal=${orderTotal} === serverExpected=${expectedTotal}`);
 
       // ── Fetch credentials dùng serverToken (server role có quyền đọc credentials) ─
       const deltaByAccountId = {};
@@ -637,10 +747,12 @@ module.exports = (db) => {
             }
             slotsByAccountId[accountId] = assignedSlots;
             // Đảm bảo status = 'sold' nếu chưa được set (lần trước bị crash giữa chừng)
+            // SECURITY FIX: dùng serverToken thay vì userToken — userToken có thể expire
+            // khi user navigate đến OrderDetailPage sau thời gian dài
             if (accData.status !== 'sold') {
               try {
-                await db.update('accounts', accountId, { status: 'sold' }, userToken);
-                console.log(`✅ Re-set status=sold for ${accountId}`);
+                await db.update('accounts', accountId, { status: 'sold' }, serverToken);
+                console.log(`✅ Re-set status=sold for ${accountId} (via serverToken)`);
               } catch (se) {
                 console.warn(`⚠️ Re-set status failed for ${accountId}:`, se.message);
               }
