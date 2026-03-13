@@ -363,11 +363,21 @@ module.exports = (db) => {
     console.log(`✅ Referral commission: ${commissionAmount}đ → ${referrerId}`);
   }
 
-  // ── Middleware: verify Firebase ID token (FIX V10) ────────────────────
-  // Dùng Firebase Auth REST API để verify token — không cần Admin SDK.
-  // GET /accounts:lookup với idToken → Firebase trả về user info nếu token hợp lệ.
-  // Firebase tự verify signature + expiry server-side.
+  // ── Middleware: verify Firebase ID token ────────────────────────────────
+  // FIX C1: Decode JWT manually để check expiry + uid TRƯỚC KHI gọi accounts:lookup.
+  // accounts:lookup không enforce expiry — attacker có thể dùng token đã hết hạn.
+  // Giải pháp: decode JWT payload (base64), check exp claim, sau đó verify với Firebase.
   const _fetchModule = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
+
+  function decodeJwtPayload(token) {
+    try {
+      const parts = token.split('.');
+      if (parts.length !== 3) return null;
+      const payload = Buffer.from(parts[1], 'base64url').toString('utf8');
+      return JSON.parse(payload);
+    } catch { return null; }
+  }
+
   async function verifyFirebaseToken(req, res, next) {
     const authHeader = req.headers['authorization'] || '';
     const idToken = authHeader.replace(/^Bearer\s+/i, '').trim();
@@ -375,6 +385,21 @@ module.exports = (db) => {
       return res.status(401).json({ error: 'Missing Authorization token' });
     }
     try {
+      // FIX C1: Check expiry locally first (fast, no network)
+      const payload = decodeJwtPayload(idToken);
+      if (!payload || !payload.exp || !payload.sub) {
+        return res.status(401).json({ error: 'Invalid token format' });
+      }
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (payload.exp < nowSec) {
+        return res.status(401).json({ error: 'Token expired' });
+      }
+      // Also check iat — token should not be issued in future (clock skew >5min)
+      if (payload.iat && payload.iat > nowSec + 300) {
+        return res.status(401).json({ error: 'Token issued in future' });
+      }
+
+      // Verify with Firebase (confirms signature + not revoked)
       const apiKey = process.env.FIREBASE_API_KEY;
       const verifyRes = await _fetchModule(
         `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
@@ -389,6 +414,10 @@ module.exports = (db) => {
         return res.status(401).json({ error: 'Invalid or expired token' });
       }
       const user = data.users[0];
+      // Cross-check uid from JWT payload vs Firebase response
+      if (user.localId !== payload.sub) {
+        return res.status(401).json({ error: 'Token uid mismatch' });
+      }
       req.firebaseUid   = user.localId;
       req.firebaseEmail = user.email;
       next();
@@ -493,11 +522,14 @@ module.exports = (db) => {
       return res.status(400).json({ error: 'Missing or invalid orderId' });
     }
 
-    // FIX V7 + Race: Rate limit 1 request per orderId per 30s
-    // Buyer hợp lệ chỉ gọi 1 lần — rate limit 1/30s đủ để tránh race condition
-    // Retry hợp lệ (server error) chờ 30s là acceptable
-    if (rateLimit(`checkout:${orderId}`, 1, 30_000)) {
+    // FIX V7 + H4: Rate limit theo CẢ userId VÀ orderId
+    // - Per orderId: ngăn race condition double-inject (1 req/30s per order)
+    // - Per userId: ngăn DoS với nhiều orderId khác nhau (10 req/min per user)
+    if (rateLimit(`checkout:order:${orderId}`, 1, 30_000)) {
       return res.status(429).json({ error: 'Yêu cầu đang được xử lý. Thử lại sau 30 giây.' });
+    }
+    if (rateLimit(`checkout:user:${req.firebaseUid}`, 10, 60_000)) {
+      return res.status(429).json({ error: 'Quá nhiều yêu cầu. Thử lại sau 1 phút.' });
     }
 
     try {
@@ -608,7 +640,7 @@ module.exports = (db) => {
         try {
           const accRef = firestore.collection('accounts').doc(accountId);
 
-          await firestore.runTransaction(async (tx) => {
+          await db.runTransactionWithRetry(async (tx) => {
             const accSnap = await tx.get(accRef);
             if (!accSnap.exists) throw new Error('not_found');
 
