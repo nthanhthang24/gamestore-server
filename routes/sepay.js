@@ -651,49 +651,49 @@ module.exports = (db) => {
           }
         }
       } else {
-        // Không dùng beginTransaction (bị block bởi Firestore rules với non-admin).
-        // Thay bằng: đọc soldCount → assign slots → atomic increment với userToken.
-        // Race condition được phòng ngừa bởi rate limit 1 req/30s per orderId ở trên.
+        // Dùng Firestore transaction với serverToken.
+        // Firestore rules cho phép isAdminOrServer() update soldCount/status → beginTransaction OK.
+        // Transaction đảm bảo atomicity: 2 người mua cùng lúc → chỉ 1 người thành công.
         for (const accountId of Object.keys(deltaByAccountId)) {
           const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           let assignedSlots = [];
 
           try {
-            // Đọc account (public read, không cần token)
-            const accDoc = await db.get('accounts', accountId);
-            if (!accDoc.exists) throw new Error('not_found');
+            const accRef = firestore.collection('accounts').doc(accountId);
 
-            const accData          = accDoc.data();
-            const quantity         = accData.quantity || 1;
-            const currentSoldCount = accData.soldCount || 0;
+            await db.runTransactionWithRetry(async (tx) => {
+              const accSnap = await tx.get(accRef);
+              if (!accSnap.exists) throw new Error('not_found');
 
-            if (currentSoldCount >= 1) {
-              throw new Error('sold_out');
-            }
+              const accData          = accSnap.data();
+              const quantity         = accData.quantity || 1;
+              const currentSoldCount = accData.soldCount || 0;
 
-            // Assign credential slots dựa trên soldCount hiện tại
-            const slotStart = currentSoldCount * quantity;
-            assignedSlots = [];
-            for (let i = 0; i < quantity; i++) {
-              assignedSlots.push(creds[slotStart + i] || {
-                loginUsername: '', loginPassword: '',
-                loginEmail: '', loginNote: '',
-                attachmentContent: null, attachmentName: null,
+              if (currentSoldCount >= 1) {
+                throw new Error('sold_out');
+              }
+
+              // Assign credential slots trong transaction — đảm bảo chỉ 1 người nhận
+              const slotStart = currentSoldCount * quantity;
+              assignedSlots = [];
+              for (let i = 0; i < quantity; i++) {
+                assignedSlots.push(creds[slotStart + i] || {
+                  loginUsername: '', loginPassword: '',
+                  loginEmail: '', loginNote: '',
+                  attachmentContent: null, attachmentName: null,
+                });
+              }
+
+              tx.update(accRef, {
+                soldCount: db.FieldValue.increment(1),
+                status: 'sold',
               });
-            }
-
-            // Atomic increment dùng userToken (rules: isAuthenticated && affectedKeys hasOnly soldCount,status)
-            await db.update('accounts', accountId, {
-              soldCount: db.FieldValue.increment(1),
-              status: 'sold',
-            }, userToken);
+            }, 3, serverToken);
 
             slotsByAccountId[accountId] = assignedSlots;
-            console.log(`✅ soldCount +1, status=sold, injecting ${assignedSlots.length} slots: ${accountId}`);
+            console.log(`✅ soldCount +1, status=sold (atomic tx), injecting ${assignedSlots.length} slots: ${accountId}`);
           } catch (e) {
-            // Nếu update accounts thất bại → KHÔNG inject credentials → user thấy lỗi và thử lại
-            console.error(`❌ Update soldCount failed for ${accountId}: ${e.message}`);
-            // Re-throw để caller biết checkout thất bại (không set _soldCountUpdated = true)
+            console.error(`❌ Transaction failed for ${accountId}: ${e.message}`);
             throw new Error(`Không thể cập nhật trạng thái sản phẩm ${accountId}: ${e.message}`);
           }
         }
