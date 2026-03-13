@@ -579,7 +579,11 @@ module.exports = (db) => {
       if (order.status !== 'completed') {
         return res.status(409).json({ error: 'Order is not completed' });
       }
-      if (order._soldCountUpdated) {
+      // Idempotency: skip soldCount transaction if already done
+      // But STILL inject credentials if _credentialsInjected is missing
+      // (happens when server crashed/timed-out after soldCount but before credential inject)
+      const soldCountAlreadyDone = !!order._soldCountUpdated;
+      if (soldCountAlreadyDone && order._credentialsInjected) {
         return res.status(200).json({ message: 'already_updated' });
       }
       // FIX D1 server-side: verify idempotencyKey starts with owner's UID
@@ -674,60 +678,86 @@ module.exports = (db) => {
       }));
 
       // ── CRITICAL FIX: Atomic soldCount + credential slot assignment ────────
-      // Dùng Admin SDK Firestore transaction per account:
-      // 1. Read soldCount (inside tx)
-      // 2. Assign slot indices (based on current soldCount)
-      // 3. Increment soldCount (inside tx)
-      // → 2 concurrent purchases sẽ nhận 2 different slots — không có double-delivery
       const firestore = db.getFirestore();
       const slotsByAccountId = {}; // accountId → [slot, slot, ...]
 
-      // Process each account sequentially to avoid transaction conflicts
-      for (const accountId of Object.keys(deltaByAccountId)) {
-        const delta = deltaByAccountId[accountId];
-        const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
-        let assignedSlots = [];
-
-        try {
-          const accRef = firestore.collection('accounts').doc(accountId);
-
-          await db.runTransactionWithRetry(async (tx) => {
-            const accSnap = await tx.get(accRef);
-            if (!accSnap.exists) throw new Error('not_found');
-
-            const accData         = accSnap.data();
-            const quantity        = accData.quantity || 1;
-            const currentSoldCount = accData.soldCount || 0;
-
-            if (currentSoldCount + delta > quantity) {
-              throw new Error('sold_out');
-            }
-
-            // Assign credential slots inside transaction (atomic)
-            assignedSlots = [];
+      if (soldCountAlreadyDone) {
+        // soldCount already updated — just read current soldCount to assign credential slots
+        // We re-read the current soldCount from accounts to figure out which slots were assigned
+        // Slot index = soldCount AFTER purchase - delta ... soldCount AFTER purchase - 1
+        console.log(`ℹ️ soldCount already done, re-injecting credentials only`);
+        for (const accountId of Object.keys(deltaByAccountId)) {
+          const delta = deltaByAccountId[accountId];
+          const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
+          try {
+            const accDoc = await db.get('accounts', accountId);
+            const currentSoldCount = accDoc.exists ? (accDoc.data().soldCount || 0) : delta;
+            // Slots assigned during original purchase: indices [soldCount-delta .. soldCount-1]
+            const assignedSlots = [];
             for (let i = 0; i < delta; i++) {
-              const slotIndex = currentSoldCount + i;
-              assignedSlots.push(creds[slotIndex] || {
-                loginUsername: '', loginPassword: '',
-                loginEmail: '', loginNote: '',
+              const slotIndex = (currentSoldCount - delta) + i;
+              assignedSlots.push(creds[Math.max(0, slotIndex)] || {
+                loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
                 attachmentContent: null, attachmentName: null,
               });
             }
+            slotsByAccountId[accountId] = assignedSlots;
+          } catch (e) {
+            console.warn(`⚠️ Re-fetch account ${accountId}:`, e.message);
+            slotsByAccountId[accountId] = Array(delta).fill({
+              loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
+              attachmentContent: null, attachmentName: null,
+            });
+          }
+        }
+      } else {
+        // Normal path: run transaction to atomically assign slots + increment soldCount
+        // Process each account sequentially to avoid transaction conflicts
+        for (const accountId of Object.keys(deltaByAccountId)) {
+          const delta = deltaByAccountId[accountId];
+          const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
+          let assignedSlots = [];
 
-            const updateData = { soldCount: db.FieldValue.increment(delta) };
-            if (currentSoldCount + delta >= quantity) updateData.status = 'sold';
-            tx.update(accRef, updateData);
-          });
+          try {
+            const accRef = firestore.collection('accounts').doc(accountId);
 
-          slotsByAccountId[accountId] = assignedSlots;
-          console.log(`✅ soldCount +${delta}: ${accountId}`);
-        } catch (e) {
-          console.error(`❌ Transaction failed for ${accountId}: ${e.message}`);
-          // Order vẫn được ghi nhưng credentials rỗng — admin có thể xử lý thủ công
-          slotsByAccountId[accountId] = Array(delta).fill({
-            loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
-            attachmentContent: null, attachmentName: null,
-          });
+            await db.runTransactionWithRetry(async (tx) => {
+              const accSnap = await tx.get(accRef);
+              if (!accSnap.exists) throw new Error('not_found');
+
+              const accData          = accSnap.data();
+              const quantity         = accData.quantity || 1;
+              const currentSoldCount = accData.soldCount || 0;
+
+              if (currentSoldCount + delta > quantity) {
+                throw new Error('sold_out');
+              }
+
+              // Assign credential slots inside transaction (atomic)
+              assignedSlots = [];
+              for (let i = 0; i < delta; i++) {
+                const slotIndex = currentSoldCount + i;
+                assignedSlots.push(creds[slotIndex] || {
+                  loginUsername: '', loginPassword: '',
+                  loginEmail: '', loginNote: '',
+                  attachmentContent: null, attachmentName: null,
+                });
+              }
+
+              const updateData = { soldCount: db.FieldValue.increment(delta) };
+              if (currentSoldCount + delta >= quantity) updateData.status = 'sold';
+              tx.update(accRef, updateData);
+            });
+
+            slotsByAccountId[accountId] = assignedSlots;
+            console.log(`✅ soldCount +${delta}: ${accountId}`);
+          } catch (e) {
+            console.error(`❌ Transaction failed for ${accountId}: ${e.message}`);
+            slotsByAccountId[accountId] = Array(delta).fill({
+              loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
+              attachmentContent: null, attachmentName: null,
+            });
+          }
         }
       }
 
