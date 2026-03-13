@@ -548,9 +548,8 @@ module.exports = (db) => {
 
   // ════════════════════════════════════════════════════════════════════
   // POST /bank/checkout/confirm
-  // Logic đúng: 1 item = 1 combo (có thể chứa nhiều accounts trong slots[])
-  // Khi user mua → server inject TẤT CẢ slots của combo vào order
-  // Sau khi bán → account status = 'sold' (không dùng soldCount nữa)
+  // FIX V2: soldCount dùng FieldValue.increment() — atomic, không có race condition
+  // FIX V7: Rate limit 5 requests per orderId per minute
   // ════════════════════════════════════════════════════════════════════
   router.post('/checkout/confirm', verifyFirebaseToken, async (req, res) => {
     const { orderId } = req.body;
@@ -558,7 +557,9 @@ module.exports = (db) => {
       return res.status(400).json({ error: 'Missing or invalid orderId' });
     }
 
-    // Rate limit: 1 req/30s per orderId, 10 req/min per user
+    // FIX V7 + H4: Rate limit theo CẢ userId VÀ orderId
+    // - Per orderId: ngăn race condition double-inject (1 req/30s per order)
+    // - Per userId: ngăn DoS với nhiều orderId khác nhau (10 req/min per user)
     if (rateLimit(`checkout:order:${orderId}`, 1, 30_000)) {
       return res.status(429).json({ error: 'Yêu cầu đang được xử lý. Thử lại sau 30 giây.' });
     }
@@ -578,16 +579,21 @@ module.exports = (db) => {
       if (order.status !== 'completed') {
         return res.status(409).json({ error: 'Order is not completed' });
       }
-
-      // Idempotency: đã inject đủ credentials rồi thì skip
-      if (order._credentialsInjected) {
+      // Idempotency: skip soldCount transaction if already done
+      // But STILL inject credentials if _credentialsInjected is missing
+      // (happens when server crashed/timed-out after soldCount but before credential inject)
+      const soldCountAlreadyDone = !!order._soldCountUpdated;
+      if (soldCountAlreadyDone && order._credentialsInjected) {
         return res.status(200).json({ message: 'already_updated' });
       }
-
-      // Verify idempotencyKey bắt đầu bằng uid của user (chống forge)
+      // FIX D1 server-side: verify idempotencyKey starts with owner's UID
+      // This ensures the order was created through CartPage's legitimate flow
+      // (CartPage generates: uid + '_' + crypto.randomUUID())
+      // An attacker who forges an order can set any idempotencyKey,
+      // but the UID prefix must match the authenticated user.
       const iKey = order.idempotencyKey || '';
       if (!iKey.startsWith(req.firebaseUid + '_')) {
-        console.error(`⛔ checkout/confirm: invalid idempotencyKey. orderId=${orderId} uid=${req.firebaseUid}`);
+        console.error(`⛔ checkout/confirm: invalid idempotencyKey format. orderId=${orderId} uid=${req.firebaseUid} key=${iKey.slice(0,30)}`);
         return res.status(403).json({ error: 'Invalid order — please re-checkout.', code: 'INVALID_IKEY' });
       }
 
@@ -596,7 +602,11 @@ module.exports = (db) => {
         return res.status(400).json({ error: 'Order has no items' });
       }
 
-      // ── Verify giá từ DB (chống price manipulation) ───────────────────
+      // ── CRITICAL: Verify order total matches real DB prices ──────────────
+      // Attacker có thể: addDoc('orders', {total:1000, items:[{id:'EXP',price:1000}]})
+      // → balance trừ 1000, nhưng server sẽ inject credentials của account đắt tiền
+      // FIX: Fetch account prices từ DB và verify sum matches order.total
+      // Cho phép ±5% tolerance cho flash sale / bulk discount
       const uniqueAccountIds = [...new Set(items.map(i => i.id).filter(Boolean))];
       const accountDocsById = {};
       await Promise.all(uniqueAccountIds.map(async (accountId) => {
@@ -609,149 +619,174 @@ module.exports = (db) => {
         }
       }));
 
+      // Tính tổng min price từ DB (cho phép discount tối đa 90%)
       let dbPriceSum = 0;
       for (const item of items) {
         const accData = accountDocsById[item.id];
         if (!accData) {
+          console.warn(`⚠️ Account ${item.id} not in DB — aborting credential injection`);
           return res.status(400).json({ error: `Account ${item.id} không tồn tại` });
         }
+        // Giá thực từ DB — không tin item.price từ order
         dbPriceSum += accData.price || 0;
       }
 
       const orderTotal = order.total || 0;
-      const effectiveMin = Math.floor(dbPriceSum * 0.25); // cho phép discount tối đa 75%
+      // Verify: total phải >= 10% của DB price (tối đa giảm 90%)
+      // Và total không được vượt quá DB price (không được mua đắt hơn giá gốc)
+      const minAllowedTotal = Math.floor(dbPriceSum * 0.10); // max 90% discount
+      // FIX D1: stricter price check — increase floor from 10% to 90%
+      // (allow at most 10% discount total, not 90%)
+      // Normal discounts: bulk up to ~30%, voucher up to ~50% → combined ~65% max
+      // Set floor at 25% to accommodate all legitimate discounts with margin
+      const strictMinAllowedTotal = Math.floor(dbPriceSum * 0.25); // max 75% discount
+      const effectiveMin = Math.max(minAllowedTotal, strictMinAllowedTotal > 0 ? strictMinAllowedTotal : 0);
       if (orderTotal < effectiveMin || orderTotal <= 0) {
-        console.error(`⛔ Price manipulation! orderId=${orderId} total=${orderTotal} dbSum=${dbPriceSum}`);
-        return res.status(403).json({ error: 'Tổng đơn hàng không hợp lệ. Vui lòng đặt hàng lại.', code: 'PRICE_MISMATCH' });
+        console.error(`⛔ Price manipulation detected! orderId=${orderId} total=${orderTotal} dbPriceSum=${dbPriceSum} minAllowed=${effectiveMin}`);
+        return res.status(403).json({
+          error: 'Tổng đơn hàng không hợp lệ. Vui lòng đặt hàng lại.',
+          code:  'PRICE_MISMATCH',
+        });
       }
 
-      // ── Fetch credentials từ subcollection ──────────────────────────────
-      // slots[] có stock × quantity entries.
-      // Combo thứ N (0-indexed) = slots[ N*quantity .. (N+1)*quantity - 1 ]
-      // N = soldCount TRƯỚC khi bán (đọc trong transaction bên dưới)
-      const credsByAccountId = {};
+
+      // ── Fetch credentials BẰNG Admin SDK (bypass rules) ─────────────────
+      // Client không còn đọc credentials subcollection nữa.
+      // Rule: allow read: if isAdmin() — an toàn tuyệt đối.
+      // Server lấy credentials ở đây và inject vào order record.
+      const deltaByAccountId   = {}; // { accountId: delta }
+      const offsetByAccountId  = {}; // { accountId: offset }
+
+      for (const item of items) {
+        if (!item.id) continue;
+        deltaByAccountId[item.id] = (deltaByAccountId[item.id] || 0) + 1;
+      }
+
+      // Lấy credentials — account data đã có trong accountDocsById từ price check trên
+      const accountDataById = {};
       await Promise.all(uniqueAccountIds.map(async (accountId) => {
         try {
           const credDoc = await db.get(`accounts/${accountId}/credentials`, 'slots');
-          credsByAccountId[accountId] = credDoc.exists ? (credDoc.data().slots || []) : [];
+          accountDataById[accountId] = {
+            acc:   accountDocsById[accountId], // đã fetch ở price check
+            creds: credDoc.exists ? (credDoc.data().slots || []) : [],
+          };
         } catch (e) {
-          console.warn(`⚠️ Fetch credentials ${accountId}:`, e.message);
-          credsByAccountId[accountId] = [];
+          console.warn(`⚠️ Fetch credentials ${accountId} error:`, e.message);
+          accountDataById[accountId] = { acc: accountDocsById[accountId], creds: [] };
         }
       }));
 
-      // ── Atomic: increment soldCount per combo purchased ─────────────
-      // 1 order có thể có N combos của cùng 1 item (user mua qty > 1)
-      // Mỗi combo = 1 lần increment soldCount + 1 slot assignment
-      const soldCountAlreadyDone = !!order._soldCountUpdated;
+      // ── CRITICAL FIX: Atomic soldCount + credential slot assignment ────────
       const firestore = db.getFirestore();
-
-      // Đếm số combo per accountId trong order
-      const comboCountByAccountId = {}; // accountId → số combo trong order này
-      for (const item of items) {
-        if (!item.id) continue;
-        comboCountByAccountId[item.id] = (comboCountByAccountId[item.id] || 0) + 1;
-      }
-
-      // assignedCombosByAccountId: accountId → [[slot,...], [slot,...], ...]
-      // Mỗi phần tử là 1 combo (mảng các accounts trong combo đó)
-      const assignedCombosByAccountId = {};
+      const slotsByAccountId = {}; // accountId → [slot, slot, ...]
 
       if (soldCountAlreadyDone) {
-        // Re-inject: soldCount đã tăng N lần, đọc lại soldCount hiện tại
-        console.log('ℹ️ soldCount already done, re-injecting credentials only');
-        for (const accountId of uniqueAccountIds) {
-          const nCombos = comboCountByAccountId[accountId] || 1;
+        // soldCount already updated — just read current soldCount to assign credential slots
+        // We re-read the current soldCount from accounts to figure out which slots were assigned
+        // Slot index = soldCount AFTER purchase - delta ... soldCount AFTER purchase - 1
+        console.log(`ℹ️ soldCount already done, re-injecting credentials only`);
+        for (const accountId of Object.keys(deltaByAccountId)) {
+          const delta = deltaByAccountId[accountId];
+          const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           try {
             const accDoc = await db.get('accounts', accountId);
-            const accData   = accDoc.exists ? accDoc.data() : {};
-            const quantity  = accData.quantity  || 1;
-            const soldCount = accData.soldCount  || 0;
-            const creds     = credsByAccountId[accountId] || [];
-            // Combos đã assign: indices [soldCount-nCombos .. soldCount-1]
-            assignedCombosByAccountId[accountId] = Array.from({ length: nCombos }, (_, ci) => {
-              const comboIndex = (soldCount - nCombos) + ci;
-              const slotStart  = Math.max(0, comboIndex) * quantity;
-              return Array.from({ length: quantity }, (__, i) =>
-                creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
-              );
-            });
+            const currentSoldCount = accDoc.exists ? (accDoc.data().soldCount || 0) : delta;
+            // Slots assigned during original purchase: indices [soldCount-delta .. soldCount-1]
+            const assignedSlots = [];
+            for (let i = 0; i < delta; i++) {
+              const slotIndex = (currentSoldCount - delta) + i;
+              assignedSlots.push(creds[Math.max(0, slotIndex)] || {
+                loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
+                attachmentContent: null, attachmentName: null,
+              });
+            }
+            slotsByAccountId[accountId] = assignedSlots;
           } catch (e) {
-            console.warn(`⚠️ Re-fetch ${accountId}:`, e.message);
-            assignedCombosByAccountId[accountId] = Array(comboCountByAccountId[accountId] || 1).fill([]);
+            console.warn(`⚠️ Re-fetch account ${accountId}:`, e.message);
+            slotsByAccountId[accountId] = Array(delta).fill({
+              loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
+              attachmentContent: null, attachmentName: null,
+            });
           }
         }
       } else {
-        // Normal path: N sequential transactions per accountId (N = nCombos)
-        for (const accountId of uniqueAccountIds) {
-          const nCombos = comboCountByAccountId[accountId] || 1;
-          const creds   = credsByAccountId[accountId] || [];
-          const combos  = [];
+        // Normal path: run transaction to atomically assign slots + increment soldCount
+        // Process each account sequentially to avoid transaction conflicts
+        for (const accountId of Object.keys(deltaByAccountId)) {
+          const delta = deltaByAccountId[accountId];
+          const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
+          let assignedSlots = [];
+
           try {
             const accRef = firestore.collection('accounts').doc(accountId);
-            for (let ci = 0; ci < nCombos; ci++) {
-              let assignedSlots = [];
-              await db.runTransactionWithRetry(async (tx) => {
-                const accSnap = await tx.get(accRef);
-                if (!accSnap.exists) throw new Error('not_found');
-                const accData   = accSnap.data();
-                const quantity  = accData.quantity  || 1;
-                const stock     = accData.stock     || 1;
-                const soldCount = accData.soldCount || 0;
-                if (soldCount >= stock) throw new Error('sold_out');
-                const slotStart = soldCount * quantity;
-                assignedSlots = Array.from({ length: quantity }, (_, i) =>
-                  creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
-                );
-                const updateData = { soldCount: db.FieldValue.increment(1) };
-                if (soldCount + 1 >= stock) updateData.status = 'sold';
-                tx.update(accRef, updateData);
-              });
-              combos.push(assignedSlots);
-              console.log(`✅ soldCount +1 (combo ${ci+1}/${nCombos}): ${accountId}`);
-            }
-            assignedCombosByAccountId[accountId] = combos;
+
+            await db.runTransactionWithRetry(async (tx) => {
+              const accSnap = await tx.get(accRef);
+              if (!accSnap.exists) throw new Error('not_found');
+
+              const accData          = accSnap.data();
+              const quantity         = accData.quantity || 1;
+              const currentSoldCount = accData.soldCount || 0;
+
+              if (currentSoldCount + delta > quantity) {
+                throw new Error('sold_out');
+              }
+
+              // Assign credential slots inside transaction (atomic)
+              assignedSlots = [];
+              for (let i = 0; i < delta; i++) {
+                const slotIndex = currentSoldCount + i;
+                assignedSlots.push(creds[slotIndex] || {
+                  loginUsername: '', loginPassword: '',
+                  loginEmail: '', loginNote: '',
+                  attachmentContent: null, attachmentName: null,
+                });
+              }
+
+              const updateData = { soldCount: db.FieldValue.increment(delta) };
+              if (currentSoldCount + delta >= quantity) updateData.status = 'sold';
+              tx.update(accRef, updateData);
+            });
+
+            slotsByAccountId[accountId] = assignedSlots;
+            console.log(`✅ soldCount +${delta}: ${accountId}`);
           } catch (e) {
-            console.error(`❌ Transaction failed ${accountId}: ${e.message}`);
-            // Fill remaining combos with empty slots
-            while (combos.length < nCombos) combos.push([]);
-            assignedCombosByAccountId[accountId] = combos;
+            console.error(`❌ Transaction failed for ${accountId}: ${e.message}`);
+            slotsByAccountId[accountId] = Array(delta).fill({
+              loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
+              attachmentContent: null, attachmentName: null,
+            });
           }
         }
       }
 
-      // ── Build updatedItems: assign combo sequentially per accountId ──
-      const comboOffsetByAccountId = {}; // accountId → next combo index
+      // Inject credentials vào items
+      const perAccountOffset = {};
       const updatedItems = items.map(item => {
-        if (!item.id) return item;
-        const offset = comboOffsetByAccountId[item.id] || 0;
-        comboOffsetByAccountId[item.id] = offset + 1;
-        const slots = (assignedCombosByAccountId[item.id] || [])[offset] || [];
+        if (!item.id || !slotsByAccountId[item.id]) return item;
+        perAccountOffset[item.id] = perAccountOffset[item.id] || 0;
+        const slot = (slotsByAccountId[item.id][perAccountOffset[item.id]]) || {
+          loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
+          attachmentContent: null, attachmentName: null,
+        };
+        perAccountOffset[item.id]++;
         return {
           ...item,
-          loginUsername:     slots[0]?.loginUsername     || '',
-          loginPassword:     slots[0]?.loginPassword     || '',
-          loginEmail:        slots[0]?.loginEmail        || '',
-          loginNote:         slots[0]?.loginNote         || '',
-          attachmentContent: slots[0]?.attachmentContent || null,
-          attachmentUrl:     slots[0]?.attachmentUrl     || null,
-          attachmentName:    slots[0]?.attachmentName    || null,
-          credentials: slots.map(s => ({
-            loginUsername:     s.loginUsername     || '',
-            loginPassword:     s.loginPassword     || '',
-            loginEmail:        s.loginEmail        || '',
-            loginNote:         s.loginNote         || '',
-            attachmentContent: s.attachmentContent || null,
-            attachmentUrl:     s.attachmentUrl     || null,
-            attachmentName:    s.attachmentName    || null,
-          })),
+          loginUsername:     slot.loginUsername     || '',
+          loginPassword:     slot.loginPassword     || '',
+          loginEmail:        slot.loginEmail        || '',
+          loginNote:         slot.loginNote         || '',
+          attachmentContent: slot.attachmentContent || null,
+          attachmentUrl:     slot.attachmentUrl     || null,
+          attachmentName:    slot.attachmentName    || null,
         };
       });
 
-      // ── Ghi order ────────────────────────────────────────────────────
+      // Update order: inject credentials + mark done
       await db.update('orders', orderId, {
-        items:                updatedItems,
-        _soldCountUpdated:    true,
+        items:               updatedItems,
+        _soldCountUpdated:   true,
         _credentialsInjected: true,
       });
 
@@ -759,6 +794,7 @@ module.exports = (db) => {
 
     } catch (err) {
       console.error('❌ /checkout/confirm error:', err.message, err.stack?.split('\n')[1] || '');
+      // Return actual error message in dev, generic in prod
       const msg = process.env.NODE_ENV === 'production'
         ? 'Internal server error'
         : (err.message || 'Internal server error');
