@@ -655,7 +655,7 @@ module.exports = (db) => {
         for (const accountId of Object.keys(deltaByAccountId)) {
           const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           try {
-            const accDoc = await db.get('accounts', accountId);
+            const accDoc = await db.get('accounts', accountId, userToken);
             const accData  = accDoc.exists ? accDoc.data() : {};
             const quantity = accData.quantity || 1;
             // soldCount đã tăng → combo index = soldCount - 1
@@ -712,7 +712,7 @@ module.exports = (db) => {
                 soldCount: db.FieldValue.increment(1),
                 status: 'sold',
               });
-            });
+            }, 3, userToken);
 
             slotsByAccountId[accountId] = assignedSlots;
             console.log(`✅ soldCount +1, injecting ${assignedSlots.length} slots: ${accountId}`);
@@ -757,11 +757,11 @@ module.exports = (db) => {
       });
 
       // Update order: inject credentials + mark done
-      await db.updateWithToken('orders', orderId, {
+      await db.update('orders', orderId, {
         items:               updatedItems,
         _soldCountUpdated:   true,
         _credentialsInjected: true,
-      });
+      }, userToken);
 
       return res.status(200).json({ message: 'success' });
 
