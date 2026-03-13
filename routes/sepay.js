@@ -583,7 +583,11 @@ module.exports = (db) => {
       // But STILL inject credentials if _credentialsInjected is missing
       // (happens when server crashed/timed-out after soldCount but before credential inject)
       const soldCountAlreadyDone = !!order._soldCountUpdated;
-      if (soldCountAlreadyDone && order._credentialsInjected) {
+      // Idempotency: chỉ skip nếu ĐÃ inject VÀ allCredentials có data
+      const hasAllCreds = (order.items || []).some(i =>
+        i.allCredentials?.length > 0 || i.loginUsername
+      );
+      if (soldCountAlreadyDone && order._credentialsInjected && hasAllCreds) {
         return res.status(200).json({ message: 'already_updated' });
       }
       // FIX D1 server-side: verify idempotencyKey starts with owner's UID
