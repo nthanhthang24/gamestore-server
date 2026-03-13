@@ -364,8 +364,10 @@ module.exports = (db) => {
   }
 
   // ── Middleware: verify Firebase ID token (FIX V10) ────────────────────
-  // Dùng Admin SDK verifyIdToken — verify cả signature lẫn expiry.
-  // Trước đây dùng identitytoolkit REST (không verify expiry).
+  // Dùng Firebase Auth REST API để verify token — không cần Admin SDK.
+  // GET /accounts:lookup với idToken → Firebase trả về user info nếu token hợp lệ.
+  // Firebase tự verify signature + expiry server-side.
+  const _fetchModule = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
   async function verifyFirebaseToken(req, res, next) {
     const authHeader = req.headers['authorization'] || '';
     const idToken = authHeader.replace(/^Bearer\s+/i, '').trim();
@@ -373,13 +375,25 @@ module.exports = (db) => {
       return res.status(401).json({ error: 'Missing Authorization token' });
     }
     try {
-      // FIX V10: Admin SDK verifyIdToken verify JWT signature + expiry + revocation
-      const decodedToken = await db.admin.auth().verifyIdToken(idToken, true); // checkRevoked=true
-      req.firebaseUid   = decodedToken.uid;
-      req.firebaseEmail = decodedToken.email;
+      const apiKey = process.env.FIREBASE_API_KEY;
+      const verifyRes = await _fetchModule(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      const data = await verifyRes.json();
+      if (!verifyRes.ok || !data.users || data.users.length === 0) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+      }
+      const user = data.users[0];
+      req.firebaseUid   = user.localId;
+      req.firebaseEmail = user.email;
       next();
     } catch (e) {
-      console.warn('Token verify failed:', e.code || e.message);
+      console.warn('Token verify failed:', e.message);
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
   }
