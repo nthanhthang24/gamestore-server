@@ -685,18 +685,19 @@ module.exports = (db) => {
         // soldCount already updated — just read current soldCount to assign credential slots
         // We re-read the current soldCount from accounts to figure out which slots were assigned
         // Slot index = soldCount AFTER purchase - delta ... soldCount AFTER purchase - 1
-        console.log(`ℹ️ soldCount already done, re-injecting credentials only`);
+        console.log(`ℹ️ soldCount already done, re-injecting all combo slots`);
         for (const accountId of Object.keys(deltaByAccountId)) {
-          const delta = deltaByAccountId[accountId];
           const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           try {
             const accDoc = await db.get('accounts', accountId);
-            const currentSoldCount = accDoc.exists ? (accDoc.data().soldCount || 0) : delta;
-            // Slots assigned during original purchase: indices [soldCount-delta .. soldCount-1]
+            const accData  = accDoc.exists ? accDoc.data() : {};
+            const quantity = accData.quantity || 1;
+            // soldCount đã tăng → combo index = soldCount - 1
+            const soldCount  = accData.soldCount || 1;
+            const slotStart  = (soldCount - 1) * quantity;
             const assignedSlots = [];
-            for (let i = 0; i < delta; i++) {
-              const slotIndex = (currentSoldCount - delta) + i;
-              assignedSlots.push(creds[Math.max(0, slotIndex)] || {
+            for (let i = 0; i < quantity; i++) {
+              assignedSlots.push(creds[slotStart + i] || {
                 loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
                 attachmentContent: null, attachmentName: null,
               });
@@ -704,17 +705,14 @@ module.exports = (db) => {
             slotsByAccountId[accountId] = assignedSlots;
           } catch (e) {
             console.warn(`⚠️ Re-fetch account ${accountId}:`, e.message);
-            slotsByAccountId[accountId] = Array(delta).fill({
-              loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
-              attachmentContent: null, attachmentName: null,
-            });
+            slotsByAccountId[accountId] = [];
           }
         }
       } else {
-        // Normal path: run transaction to atomically assign slots + increment soldCount
-        // Process each account sequentially to avoid transaction conflicts
+        // Normal path: atomic transaction — assign TẤT CẢ slots của combo
+        // quantity = số accounts trong combo, soldCount = số lần đã bán
+        // slotStart = soldCount * quantity → inject slots[slotStart..slotStart+quantity-1]
         for (const accountId of Object.keys(deltaByAccountId)) {
-          const delta = deltaByAccountId[accountId];
           const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           let assignedSlots = [];
 
@@ -729,57 +727,66 @@ module.exports = (db) => {
               const quantity         = accData.quantity || 1;
               const currentSoldCount = accData.soldCount || 0;
 
-              if (currentSoldCount + delta > quantity) {
-                throw new Error('sold_out');
+              if (currentSoldCount >= 1) {
+                throw new Error('sold_out'); // mỗi item chỉ bán 1 lần
               }
 
-              // Assign credential slots inside transaction (atomic)
+              // Inject TẤT CẢ quantity slots của combo
+              const slotStart = currentSoldCount * quantity;
               assignedSlots = [];
-              for (let i = 0; i < delta; i++) {
-                const slotIndex = currentSoldCount + i;
-                assignedSlots.push(creds[slotIndex] || {
+              for (let i = 0; i < quantity; i++) {
+                assignedSlots.push(creds[slotStart + i] || {
                   loginUsername: '', loginPassword: '',
                   loginEmail: '', loginNote: '',
                   attachmentContent: null, attachmentName: null,
                 });
               }
 
-              const updateData = { soldCount: db.FieldValue.increment(delta) };
-              if (currentSoldCount + delta >= quantity) updateData.status = 'sold';
-              tx.update(accRef, updateData);
+              tx.update(accRef, {
+                soldCount: db.FieldValue.increment(1),
+                status: 'sold',
+              });
             });
 
             slotsByAccountId[accountId] = assignedSlots;
-            console.log(`✅ soldCount +${delta}: ${accountId}`);
+            console.log(`✅ soldCount +1, injecting ${assignedSlots.length} slots: ${accountId}`);
           } catch (e) {
             console.error(`❌ Transaction failed for ${accountId}: ${e.message}`);
-            slotsByAccountId[accountId] = Array(delta).fill({
-              loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
-              attachmentContent: null, attachmentName: null,
-            });
+            slotsByAccountId[accountId] = [];
           }
         }
       }
 
       // Inject credentials vào items
-      const perAccountOffset = {};
+      // Mỗi item nhận TẤT CẢ slots của combo:
+      //   item.loginUsername = slot[0] (backward compat, hiển thị chính)
+      //   item.allCredentials = [slot0, slot1, ...] (tất cả accounts trong combo)
       const updatedItems = items.map(item => {
         if (!item.id || !slotsByAccountId[item.id]) return item;
-        perAccountOffset[item.id] = perAccountOffset[item.id] || 0;
-        const slot = (slotsByAccountId[item.id][perAccountOffset[item.id]]) || {
+        const slots = slotsByAccountId[item.id];
+        const first = slots[0] || {
           loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
-          attachmentContent: null, attachmentName: null,
+          attachmentContent: null, attachmentUrl: null, attachmentName: null,
         };
-        perAccountOffset[item.id]++;
         return {
           ...item,
-          loginUsername:     slot.loginUsername     || '',
-          loginPassword:     slot.loginPassword     || '',
-          loginEmail:        slot.loginEmail        || '',
-          loginNote:         slot.loginNote         || '',
-          attachmentContent: slot.attachmentContent || null,
-          attachmentUrl:     slot.attachmentUrl     || null,
-          attachmentName:    slot.attachmentName    || null,
+          loginUsername:     first.loginUsername     || '',
+          loginPassword:     first.loginPassword     || '',
+          loginEmail:        first.loginEmail        || '',
+          loginNote:         first.loginNote         || '',
+          attachmentContent: first.attachmentContent || null,
+          attachmentUrl:     first.attachmentUrl     || null,
+          attachmentName:    first.attachmentName    || null,
+          // Tất cả accounts trong combo
+          allCredentials: slots.map(s => ({
+            loginUsername:     s.loginUsername     || '',
+            loginPassword:     s.loginPassword     || '',
+            loginEmail:        s.loginEmail        || '',
+            loginNote:         s.loginNote         || '',
+            attachmentContent: s.attachmentContent || null,
+            attachmentUrl:     s.attachmentUrl     || null,
+            attachmentName:    s.attachmentName    || null,
+          })),
         };
       });
 
