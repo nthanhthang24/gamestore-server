@@ -636,6 +636,15 @@ module.exports = (db) => {
               });
             }
             slotsByAccountId[accountId] = assignedSlots;
+            // Đảm bảo status = 'sold' nếu chưa được set (lần trước bị crash giữa chừng)
+            if (accData.status !== 'sold') {
+              try {
+                await db.update('accounts', accountId, { status: 'sold' }, userToken);
+                console.log(`✅ Re-set status=sold for ${accountId}`);
+              } catch (se) {
+                console.warn(`⚠️ Re-set status failed for ${accountId}:`, se.message);
+              }
+            }
           } catch (e) {
             console.warn(`⚠️ Re-fetch account ${accountId}:`, e.message);
             slotsByAccountId[accountId] = [];
@@ -680,10 +689,12 @@ module.exports = (db) => {
             }, userToken);
 
             slotsByAccountId[accountId] = assignedSlots;
-            console.log(`✅ soldCount +1, injecting ${assignedSlots.length} slots: ${accountId}`);
+            console.log(`✅ soldCount +1, status=sold, injecting ${assignedSlots.length} slots: ${accountId}`);
           } catch (e) {
+            // Nếu update accounts thất bại → KHÔNG inject credentials → user thấy lỗi và thử lại
             console.error(`❌ Update soldCount failed for ${accountId}: ${e.message}`);
-            slotsByAccountId[accountId] = [];
+            // Re-throw để caller biết checkout thất bại (không set _soldCountUpdated = true)
+            throw new Error(`Không thể cập nhật trạng thái sản phẩm ${accountId}: ${e.message}`);
           }
         }
       }
