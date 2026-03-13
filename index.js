@@ -32,11 +32,27 @@ const devOrigins = process.env.NODE_ENV !== 'production'
   : [];
 const allowedOrigins = [...new Set([...prodOrigins, ...devOrigins])];
 
+// Vercel preview URLs pattern (e.g. gamestore-client-abc123-user.vercel.app)
+const VERCEL_PROJECT_NAMES = (process.env.VERCEL_PROJECT_NAMES || 'gamestore-client,playtogethermarket')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // server-to-server (webhook)
+  if (allowedOrigins.includes(origin)) return true;
+  if (allowedOrigins.length === 0 && process.env.NODE_ENV !== 'production') return true;
+  // Allow all Vercel deployments for configured project names
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    if (host.endsWith('.vercel.app')) {
+      return VERCEL_PROJECT_NAMES.some(name => host.startsWith(name + '-') || host === name + '.vercel.app');
+    }
+  } catch (_) {}
+  return false;
+}
+
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin) return callback(null, true);                           // server-to-server (webhook)
-    if (allowedOrigins.includes(origin)) return callback(null, true);  // known browser origin
-    if (allowedOrigins.length === 0) return callback(null, true);      // dev: no origins configured
+    if (isAllowedOrigin(origin)) return callback(null, true);
     callback(new Error('CORS: origin not allowed - ' + origin));
   },
   credentials: true,

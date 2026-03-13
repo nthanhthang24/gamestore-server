@@ -102,6 +102,13 @@ module.exports = (db) => {
     try {
       console.log('📩 SePay webhook raw:', JSON.stringify(req.body));
 
+      // Lấy server bot token cho tất cả operations trong webhook
+      const serverToken = await db.getServerBotToken();
+      if (!serverToken) {
+        console.error('⛔ Server bot token không khả dụng — kiểm tra SERVER_BOT_EMAIL/PASSWORD env');
+        return res.status(503).json({ error: 'Server not configured' });
+      }
+
       const {
         id: sePayId,
         gateway,
@@ -130,25 +137,21 @@ module.exports = (db) => {
       // (reassign via const in outer scope is not possible; use safeAmount below)
       if (safeAmount > 50_000_000) {
         console.warn(`⚠️ Amount vượt giới hạn: ${transferAmount}`);
-        // FIX: dùng Admin SDK — không cần Firestore rules
         await db.add('unmatchedTopups', {
           sePayId: String(sePayId), gateway, content,
           amount: safeAmount, transactionDate,
           status: 'overlimit', createdAt: db.FieldValue.serverTimestamp(),
-        });
+        }, serverToken);
         return res.status(200).json({ message: 'Amount over limit' });
       }
 
       // ── Atomic duplicate check ─────────────────────────────────────
-      // FIX V3: Admin SDK createIfNotExists — attacker không thể pre-create doc
-      // vì processedWebhooks rules là allow create: if isAdmin() (không có anonymous create)
-      // và Admin SDK bypass rules hoàn toàn.
       try {
         await db.createIfNotExists('processedWebhooks', String(sePayId), {
           sePayId: String(sePayId),
           status: 'processing',
           startedAt: db.FieldValue.serverTimestamp(),
-        });
+        }, serverToken);
       } catch(e) {
         if (e.response?.status === 409 || (e.message || '').includes('ALREADY_EXISTS')) {
           console.log('⚠️ Duplicate sePayId:', sePayId);
@@ -166,7 +169,7 @@ module.exports = (db) => {
       if (topupMatch) {
         const candidate = topupMatch[1];
         try {
-          const topupDoc = await db.get('topups', candidate);
+          const topupDoc = await db.get('topups', candidate, serverToken);
           if (topupDoc.exists) {
             const t = topupDoc.data();
             if (t.status === 'pending') {
@@ -184,7 +187,7 @@ module.exports = (db) => {
       }
 
       if (!user && content) {
-        user = await findUserByEmail(db, content);
+        user = await findUserByEmail(db, content, serverToken);
       }
 
       if (!user) {
@@ -192,15 +195,13 @@ module.exports = (db) => {
           sePayId: String(sePayId), gateway, content, code: code || null,
           amount: safeAmount, transactionDate, referenceCode,
           status: 'unmatched', createdAt: db.FieldValue.serverTimestamp(),
-        });
+        }, serverToken);
         console.log('⚠️ Unmatched transaction:', { content, transferAmount, sePayId });
         return res.status(200).json({ message: 'Unmatched - saved for manual review' });
       }
 
-      // ── Credit balance (FIX V1: dùng Admin SDK — không dựa vào Firestore rules) ──
-      // Admin SDK bypass rules → không có lỗ hổng anonymous REST credit.
-      // FieldValue.increment() là atomic server-side — không có race condition.
-      const userDoc = await db.get('users', user.userId);
+      // ── Credit balance ────────────────────────────────────────────────────
+      const userDoc = await db.get('users', user.userId, serverToken);
       if (!userDoc.exists) {
         console.error('❌ User không tìm thấy:', user.userId);
         return res.status(404).json({ error: 'User not found' });
@@ -208,13 +209,11 @@ module.exports = (db) => {
       const prev = userDoc.data().balance || 0;
       const next = prev + safeAmount;
 
-      // Tất cả writes dùng Admin SDK — bypass Firestore rules
       const writePromises = [
-        // FIX V1: Admin SDK update — không phụ thuộc rule !isAuthenticated()
         db.update('users', user.userId, {
-          balance:   db.FieldValue.increment(safeAmount), // FIX A1: use validated safeAmount
+          balance:   db.FieldValue.increment(safeAmount),
           updatedAt: db.FieldValue.serverTimestamp(),
-        }),
+        }, serverToken),
         db.add('transactions', {
           userId:        user.userId,
           userEmail:     user.userEmail,
@@ -228,7 +227,7 @@ module.exports = (db) => {
           referenceCode,
           content,
           createdAt:     db.FieldValue.serverTimestamp(),
-        }),
+        }, serverToken),
       ];
 
       if (topupDocId) {
@@ -239,7 +238,7 @@ module.exports = (db) => {
           gateway,
           referenceCode,
           approvedAt:   db.FieldValue.serverTimestamp(),
-        }));
+        }, serverToken));
       } else {
         writePromises.push(db.add('topups', {
           userId:          user.userId,
@@ -256,21 +255,21 @@ module.exports = (db) => {
           autoApproved:    true,
           approvedAt:      db.FieldValue.serverTimestamp(),
           createdAt:       db.FieldValue.serverTimestamp(),
-        }));
+        }, serverToken));
       }
 
       writePromises.push(db.update('processedWebhooks', String(sePayId), {
         status:      'done',
         userId:      user.userId,
-        amount:      safeAmount,   // FIX A1: use validated safeAmount
+        amount:      safeAmount,
         processedAt: db.FieldValue.serverTimestamp(),
-      }));
+      }, serverToken));
 
       await Promise.all(writePromises);
       console.log(`✅ Nạp +${safeAmount}đ cho ${user.userEmail} | ${prev} → ${next}`);
 
       try {
-        await processReferralCommission(db, user.userId, safeAmount);
+        await processReferralCommission(db, user.userId, safeAmount, serverToken);
       } catch (refErr) {
         console.warn('⚠️ Referral commission error (non-critical):', refErr.message);
       }
@@ -284,15 +283,15 @@ module.exports = (db) => {
   });
 
   // ── Referral Commission ───────────────────────────────────────────────
-  async function processReferralCommission(db, userId, topupAmount) {
+  async function processReferralCommission(db, userId, topupAmount, serverToken) {
     let commissionPct  = 2;
     let minTopup       = 50000;
     let newUserBonus   = 10000;
     try {
-      const settingsDoc = await db.get('settings', 'global');
+      const settingsDoc = await db.get('settings', 'global', serverToken);
       if (settingsDoc.exists) {
         const s = settingsDoc.data();
-        if (s.referralCommissionPct != null) commissionPct  = Math.min(Number(s.referralCommissionPct), 50); // FIX BUG#5: cap at 50%
+        if (s.referralCommissionPct != null) commissionPct  = Math.min(Number(s.referralCommissionPct), 50);
         if (s.referralMinTopup      != null) minTopup       = Number(s.referralMinTopup);
         if (s.referralNewUserBonus  != null) newUserBonus   = Number(s.referralNewUserBonus);
       }
@@ -300,42 +299,38 @@ module.exports = (db) => {
 
     if (topupAmount < minTopup) return;
 
-    // FIX BUG#4 RACE CONDITION: Use createIfNotExists as a distributed lock.
-    // Two concurrent webhooks for the same user will both try to create this lock doc.
-    // Only ONE will succeed (precondition: exists=false).
-    // The other gets ALREADY_EXISTS → returns early → no double commission.
     const lockKey = `referral_lock_${userId}`;
     try {
       await db.createIfNotExists('processedWebhooks', lockKey, {
         type:      'referral_lock',
         userId,
         lockedAt:  db.FieldValue.serverTimestamp(),
-      });
+      }, serverToken);
     } catch (lockErr) {
       if (lockErr.message === 'ALREADY_EXISTS' || lockErr.response?.status === 409) {
         console.log(`⚠️ Referral commission already being processed for userId=${userId}`);
         return;
       }
-      throw lockErr; // Re-throw unexpected errors
+      throw lockErr;
     }
 
     try {
       const existingCredited = await db.query('referrals', [
         ['newUserId', '==', userId],
         ['credited',  '==', true ],
-      ], null, 1);
+      ], null, 1, serverToken);
       if (existingCredited && existingCredited.length > 0) return;
 
       const pendingReferrals = await db.query('referrals', [
         ['newUserId', '==', userId],
         ['credited',  '==', false],
-      ], null, 1);
+      ], null, 1, serverToken);
       if (!pendingReferrals || pendingReferrals.length === 0) return;
 
       const prevTopups = await db.query('topups', [
         ['userId', '==', userId],
         ['status', '==', 'approved'],
-      ], null, 5);
+      ], null, 5, serverToken);
       if (prevTopups && prevTopups.length > 1) return;
 
       const referral   = pendingReferrals[0];
@@ -343,7 +338,7 @@ module.exports = (db) => {
       if (!referrerId) return;
 
       const commissionAmount = Math.round(topupAmount * commissionPct / 100);
-      const referrerDoc = await db.get('users', referrerId);
+      const referrerDoc = await db.get('users', referrerId, serverToken);
       if (!referrerDoc.exists) return;
 
       const referrerBalance = referrerDoc.data().balance || 0;
@@ -352,14 +347,14 @@ module.exports = (db) => {
         db.update('users', referrerId, {
           balance:   db.FieldValue.increment(commissionAmount),
           updatedAt: db.FieldValue.serverTimestamp(),
-        }),
+        }, serverToken),
         db.update('referrals', referral.id, {
           credited:         true,
           commissionAmount,
           commissionPct,
           topupAmount,
           creditedAt:       db.FieldValue.serverTimestamp(),
-        }),
+        }, serverToken),
         db.add('transactions', {
           userId:        referrerId,
           type:          'referral_commission',
@@ -370,7 +365,7 @@ module.exports = (db) => {
           balanceBefore: referrerBalance,
           balanceAfter:  referrerBalance + commissionAmount,
           createdAt:     db.FieldValue.serverTimestamp(),
-        }),
+        }, serverToken),
         db.add('notifications', {
           title:        '💰 Nhận hoa hồng giới thiệu!',
           body:         `Bạn bè nạp ${topupAmount.toLocaleString('vi-VN')}đ → bạn nhận ${commissionAmount.toLocaleString('vi-VN')}đ (${commissionPct}% hoa hồng).`,
@@ -381,19 +376,15 @@ module.exports = (db) => {
           read:         [],
           createdAt:    db.FieldValue.serverTimestamp(),
           createdBy:    'system',
-        }),
+        }, serverToken),
       ]);
       console.log(`✅ Referral commission: ${commissionAmount}đ → ${referrerId}`);
     } finally {
-      // Always release the lock after processing (whether success or error)
-      // This allows future webhooks to process if this one errored out
-      // (The lock prevents concurrent same-second double-credit, not future retries)
       try {
-        // Update lock status to 'done' so it still acts as dedup evidence
         await db.update('processedWebhooks', lockKey, {
           status: 'done',
           doneAt: db.FieldValue.serverTimestamp(),
-        });
+        }, serverToken);
       } catch (_) { /* non-critical */ }
     }
   }
@@ -528,8 +519,15 @@ module.exports = (db) => {
 
     // Lấy userToken từ request để dùng cho Firestore REST calls
     const userToken = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+    // Lấy server bot token để dùng cho transaction (beginTransaction yêu cầu server role)
+    const serverToken = await db.getServerBotToken();
+    if (!serverToken) {
+      console.error('⛔ Server bot token không khả dụng — kiểm tra SERVER_BOT_EMAIL/PASSWORD env');
+      return res.status(503).json({ error: 'Server not configured properly' });
+    }
 
     try {
+      // Đọc order bằng userToken (user đọc order của họ — rules cho phép)
       const orderDoc = await db.getWithToken('orders', orderId, userToken);
       if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
 
@@ -541,22 +539,13 @@ module.exports = (db) => {
       if (order.status !== 'completed') {
         return res.status(409).json({ error: 'Order is not completed' });
       }
-      // Idempotency: skip soldCount transaction if already done
-      // But STILL inject credentials if _credentialsInjected is missing
-      // (happens when server crashed/timed-out after soldCount but before credential inject)
       const soldCountAlreadyDone = !!order._soldCountUpdated;
-      // Idempotency: chỉ skip nếu ĐÃ inject VÀ allCredentials có data
       const hasAllCreds = (order.items || []).some(i =>
         i.allCredentials?.length > 0 || i.loginUsername
       );
       if (soldCountAlreadyDone && order._credentialsInjected && hasAllCreds) {
         return res.status(200).json({ message: 'already_updated' });
       }
-      // FIX D1 server-side: verify idempotencyKey starts with owner's UID
-      // This ensures the order was created through CartPage's legitimate flow
-      // (CartPage generates: uid + '_' + crypto.randomUUID())
-      // An attacker who forges an order can set any idempotencyKey,
-      // but the UID prefix must match the authenticated user.
       const iKey = order.idempotencyKey || '';
       if (!iKey.startsWith(req.firebaseUid + '_')) {
         console.error(`⛔ checkout/confirm: invalid idempotencyKey format. orderId=${orderId} uid=${req.firebaseUid} key=${iKey.slice(0,30)}`);
@@ -568,15 +557,12 @@ module.exports = (db) => {
         return res.status(400).json({ error: 'Order has no items' });
       }
 
-      // ── CRITICAL: Verify order total matches real DB prices ──────────────
-      // Attacker có thể: addDoc('orders', {total:1000, items:[{id:'EXP',price:1000}]})
-      // → balance trừ 1000, nhưng server sẽ inject credentials của account đắt tiền
-      // FIX: Fetch account prices từ DB và verify sum matches order.total
-      // Cho phép ±5% tolerance cho flash sale / bulk discount
+      // ── Verify order total matches real DB prices ─────────────────────────
       const uniqueAccountIds = [...new Set(items.map(i => i.id).filter(Boolean))];
       const accountDocsById = {};
       await Promise.all(uniqueAccountIds.map(async (accountId) => {
         try {
+          // accounts là public read — không cần token
           const accDoc = await db.get('accounts', accountId);
           accountDocsById[accountId] = accDoc.exists ? accDoc.data() : null;
         } catch (e) {
@@ -585,7 +571,6 @@ module.exports = (db) => {
         }
       }));
 
-      // Tính tổng min price từ DB (cho phép discount tối đa 90%)
       let dbPriceSum = 0;
       for (const item of items) {
         const accData = accountDocsById[item.id];
@@ -593,19 +578,12 @@ module.exports = (db) => {
           console.warn(`⚠️ Account ${item.id} not in DB — aborting credential injection`);
           return res.status(400).json({ error: `Account ${item.id} không tồn tại` });
         }
-        // Giá thực từ DB — không tin item.price từ order
         dbPriceSum += accData.price || 0;
       }
 
       const orderTotal = order.total || 0;
-      // Verify: total phải >= 10% của DB price (tối đa giảm 90%)
-      // Và total không được vượt quá DB price (không được mua đắt hơn giá gốc)
-      const minAllowedTotal = Math.floor(dbPriceSum * 0.10); // max 90% discount
-      // FIX D1: stricter price check — increase floor from 10% to 90%
-      // (allow at most 10% discount total, not 90%)
-      // Normal discounts: bulk up to ~30%, voucher up to ~50% → combined ~65% max
-      // Set floor at 25% to accommodate all legitimate discounts with margin
-      const strictMinAllowedTotal = Math.floor(dbPriceSum * 0.25); // max 75% discount
+      const minAllowedTotal = Math.floor(dbPriceSum * 0.10);
+      const strictMinAllowedTotal = Math.floor(dbPriceSum * 0.25);
       const effectiveMin = Math.max(minAllowedTotal, strictMinAllowedTotal > 0 ? strictMinAllowedTotal : 0);
       if (orderTotal < effectiveMin || orderTotal <= 0) {
         console.error(`⛔ Price manipulation detected! orderId=${orderId} total=${orderTotal} dbPriceSum=${dbPriceSum} minAllowed=${effectiveMin}`);
@@ -615,26 +593,19 @@ module.exports = (db) => {
         });
       }
 
-
-      // ── Fetch credentials BẰNG Admin SDK (bypass rules) ─────────────────
-      // Client không còn đọc credentials subcollection nữa.
-      // Rule: allow read: if isAdmin() — an toàn tuyệt đối.
-      // Server lấy credentials ở đây và inject vào order record.
-      const deltaByAccountId   = {}; // { accountId: delta }
-      const offsetByAccountId  = {}; // { accountId: offset }
-
+      // ── Fetch credentials dùng serverToken (server role có quyền đọc credentials) ─
+      const deltaByAccountId = {};
       for (const item of items) {
         if (!item.id) continue;
         deltaByAccountId[item.id] = (deltaByAccountId[item.id] || 0) + 1;
       }
 
-      // Lấy credentials — account data đã có trong accountDocsById từ price check trên
       const accountDataById = {};
       await Promise.all(uniqueAccountIds.map(async (accountId) => {
         try {
-          const credDoc = await db.getWithToken(`accounts/${accountId}/credentials`, 'slots', userToken);
+          const credDoc = await db.getWithToken(`accounts/${accountId}/credentials`, 'slots', serverToken);
           accountDataById[accountId] = {
-            acc:   accountDocsById[accountId], // đã fetch ở price check
+            acc:   accountDocsById[accountId],
             creds: credDoc.exists ? (credDoc.data().slots || []) : [],
           };
         } catch (e) {
@@ -643,22 +614,18 @@ module.exports = (db) => {
         }
       }));
 
-      // ── CRITICAL FIX: Atomic soldCount + credential slot assignment ────────
+      // ── Atomic soldCount + credential slot assignment dùng serverToken ────
       const firestore = db.getFirestore();
-      const slotsByAccountId = {}; // accountId → [slot, slot, ...]
+      const slotsByAccountId = {};
 
       if (soldCountAlreadyDone) {
-        // soldCount already updated — just read current soldCount to assign credential slots
-        // We re-read the current soldCount from accounts to figure out which slots were assigned
-        // Slot index = soldCount AFTER purchase - delta ... soldCount AFTER purchase - 1
         console.log(`ℹ️ soldCount already done, re-injecting all combo slots`);
         for (const accountId of Object.keys(deltaByAccountId)) {
           const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           try {
-            const accDoc = await db.get('accounts', accountId, userToken);
+            const accDoc = await db.get('accounts', accountId);
             const accData  = accDoc.exists ? accDoc.data() : {};
             const quantity = accData.quantity || 1;
-            // soldCount đã tăng → combo index = soldCount - 1
             const soldCount  = accData.soldCount || 1;
             const slotStart  = (soldCount - 1) * quantity;
             const assignedSlots = [];
@@ -675,9 +642,7 @@ module.exports = (db) => {
           }
         }
       } else {
-        // Normal path: atomic transaction — assign TẤT CẢ slots của combo
-        // quantity = số accounts trong combo, soldCount = số lần đã bán
-        // slotStart = soldCount * quantity → inject slots[slotStart..slotStart+quantity-1]
+        // Dùng serverToken cho transaction — server role có quyền beginTransaction
         for (const accountId of Object.keys(deltaByAccountId)) {
           const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           let assignedSlots = [];
@@ -694,10 +659,9 @@ module.exports = (db) => {
               const currentSoldCount = accData.soldCount || 0;
 
               if (currentSoldCount >= 1) {
-                throw new Error('sold_out'); // mỗi item chỉ bán 1 lần
+                throw new Error('sold_out');
               }
 
-              // Inject TẤT CẢ quantity slots của combo
               const slotStart = currentSoldCount * quantity;
               assignedSlots = [];
               for (let i = 0; i < quantity; i++) {
@@ -712,7 +676,7 @@ module.exports = (db) => {
                 soldCount: db.FieldValue.increment(1),
                 status: 'sold',
               });
-            }, 3, userToken);
+            }, 3, serverToken); // ← dùng serverToken thay vì userToken
 
             slotsByAccountId[accountId] = assignedSlots;
             console.log(`✅ soldCount +1, injecting ${assignedSlots.length} slots: ${accountId}`);
@@ -723,10 +687,6 @@ module.exports = (db) => {
         }
       }
 
-      // Inject credentials vào items
-      // Mỗi item nhận TẤT CẢ slots của combo:
-      //   item.loginUsername = slot[0] (backward compat, hiển thị chính)
-      //   item.allCredentials = [slot0, slot1, ...] (tất cả accounts trong combo)
       const updatedItems = items.map(item => {
         if (!item.id || !slotsByAccountId[item.id]) return item;
         const slots = slotsByAccountId[item.id];
@@ -743,7 +703,6 @@ module.exports = (db) => {
           attachmentContent: first.attachmentContent || null,
           attachmentUrl:     first.attachmentUrl     || null,
           attachmentName:    first.attachmentName    || null,
-          // Tất cả accounts trong combo
           allCredentials: slots.map(s => ({
             loginUsername:     s.loginUsername     || '',
             loginPassword:     s.loginPassword     || '',
@@ -756,7 +715,7 @@ module.exports = (db) => {
         };
       });
 
-      // Update order: inject credentials + mark done
+      // Update order dùng userToken (rules cho phép user update order của họ)
       await db.update('orders', orderId, {
         items:               updatedItems,
         _soldCountUpdated:   true,
@@ -767,7 +726,6 @@ module.exports = (db) => {
 
     } catch (err) {
       console.error('❌ /checkout/confirm error:', err.message, err.stack?.split('\n')[1] || '');
-      // Return actual error message in dev, generic in prod
       const msg = process.env.NODE_ENV === 'production'
         ? 'Internal server error'
         : (err.message || 'Internal server error');
@@ -779,13 +737,13 @@ module.exports = (db) => {
 };
 
 // ── Fallback: tìm user theo email ─────────────────────────────────────────
-async function findUserByEmail(db, content) {
+async function findUserByEmail(db, content, serverToken) {
   const napMatch = content.match(/NAP\s+([^\s]+)/i);
   if (!napMatch) return null;
   const id = napMatch[1].toLowerCase().trim();
   if (id.length < 3) return null;
   if (id.includes('@')) {
-    const r = await db.query('users', [['email', '==', id]], null, 1);
+    const r = await db.query('users', [['email', '==', id]], null, 1, serverToken);
     if (r.length > 0) {
       const d = r[0].data();
       return { userId: r[0].id, userEmail: d.email, displayName: d.displayName };
