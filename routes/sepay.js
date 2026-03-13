@@ -625,7 +625,10 @@ module.exports = (db) => {
         return res.status(403).json({ error: 'Tổng đơn hàng không hợp lệ. Vui lòng đặt hàng lại.', code: 'PRICE_MISMATCH' });
       }
 
-      // ── Fetch credentials từ subcollection (server token, bypass rules) ─
+      // ── Fetch credentials từ subcollection ──────────────────────────────
+      // slots[] có stock × quantity entries.
+      // Combo thứ N (0-indexed) = slots[ N*quantity .. (N+1)*quantity - 1 ]
+      // N = soldCount TRƯỚC khi bán (đọc trong transaction bên dưới)
       const credsByAccountId = {};
       await Promise.all(uniqueAccountIds.map(async (accountId) => {
         try {
@@ -637,26 +640,83 @@ module.exports = (db) => {
         }
       }));
 
-      // ── Inject TẤT CẢ slots của combo vào order item ─────────────────
-      // Logic mới: 1 item = 1 combo → inject tất cả slots[] vào item.credentials[]
-      // Mỗi item trong order là 1 combo, có thể có 1 hoặc nhiều accounts
-      const statusAlreadyUpdated = !!order._statusUpdated;
+      // ── Atomic: increment soldCount + assign combo slots ──────────────
+      // Mỗi item trong order là 1 combo.
+      // combo index = soldCount trước khi bán → slotStart = comboIndex * quantity
+      const soldCountAlreadyDone = !!order._soldCountUpdated;
+      const firestore = db.getFirestore();
+      const assignedSlotsByAccountId = {}; // accountId → [slot, ...]
 
+      if (soldCountAlreadyDone) {
+        // Re-inject: soldCount đã tăng, đọc lại để tính đúng combo index
+        console.log('ℹ️ soldCount already done, re-injecting credentials only');
+        for (const accountId of uniqueAccountIds) {
+          try {
+            const accDoc = await db.get('accounts', accountId);
+            const accData = accDoc.exists ? accDoc.data() : {};
+            const quantity   = accData.quantity  || 1;
+            const soldCount  = accData.soldCount  || 0;
+            // Combo đã bán là index = soldCount - 1 (vì đã increment rồi)
+            const comboIndex = Math.max(0, soldCount - 1);
+            const slotStart  = comboIndex * quantity;
+            const creds = credsByAccountId[accountId] || [];
+            assignedSlotsByAccountId[accountId] = Array.from({ length: quantity }, (_, i) =>
+              creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
+            );
+          } catch (e) {
+            console.warn(`⚠️ Re-fetch ${accountId}:`, e.message);
+            assignedSlotsByAccountId[accountId] = [];
+          }
+        }
+      } else {
+        // Normal path: transaction tăng soldCount + tính combo index atomically
+        for (const accountId of uniqueAccountIds) {
+          const creds = credsByAccountId[accountId] || [];
+          let assigned = [];
+          try {
+            const accRef = firestore.collection('accounts').doc(accountId);
+            await db.runTransactionWithRetry(async (tx) => {
+              const accSnap = await tx.get(accRef);
+              if (!accSnap.exists) throw new Error('not_found');
+              const accData   = accSnap.data();
+              const quantity  = accData.quantity  || 1;
+              const stock     = accData.stock     || 1;
+              const soldCount = accData.soldCount || 0;
+              if (soldCount >= stock) throw new Error('sold_out');
+              // Combo index = soldCount (0-based, trước khi increment)
+              const slotStart = soldCount * quantity;
+              assigned = Array.from({ length: quantity }, (_, i) =>
+                creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
+              );
+              const updateData = { soldCount: db.FieldValue.increment(1) };
+              if (soldCount + 1 >= stock) updateData.status = 'sold';
+              tx.update(accRef, updateData);
+            });
+            assignedSlotsByAccountId[accountId] = assigned;
+            console.log(`✅ soldCount +1: ${accountId}`);
+          } catch (e) {
+            console.error(`❌ Transaction failed ${accountId}: ${e.message}`);
+            assignedSlotsByAccountId[accountId] = [];
+          }
+        }
+      }
+
+      // ── Build updatedItems với credentials đầy đủ của combo ──────────
       const updatedItems = items.map(item => {
         if (!item.id) return item;
-        const allSlots = credsByAccountId[item.id] || [];
+        const slots = assignedSlotsByAccountId[item.id] || [];
         return {
           ...item,
-          // Credentials chính (slot đầu tiên) — giữ backward compat với OrderDetailPage
-          loginUsername:     allSlots[0]?.loginUsername     || '',
-          loginPassword:     allSlots[0]?.loginPassword     || '',
-          loginEmail:        allSlots[0]?.loginEmail        || '',
-          loginNote:         allSlots[0]?.loginNote         || '',
-          attachmentContent: allSlots[0]?.attachmentContent || null,
-          attachmentUrl:     allSlots[0]?.attachmentUrl     || null,
-          attachmentName:    allSlots[0]?.attachmentName    || null,
-          // Tất cả slots của combo (array đầy đủ)
-          credentials: allSlots.map(s => ({
+          // slot[0] — backward compat
+          loginUsername:     slots[0]?.loginUsername     || '',
+          loginPassword:     slots[0]?.loginPassword     || '',
+          loginEmail:        slots[0]?.loginEmail        || '',
+          loginNote:         slots[0]?.loginNote         || '',
+          attachmentContent: slots[0]?.attachmentContent || null,
+          attachmentUrl:     slots[0]?.attachmentUrl     || null,
+          attachmentName:    slots[0]?.attachmentName    || null,
+          // Tất cả accounts trong combo
+          credentials: slots.map(s => ({
             loginUsername:     s.loginUsername     || '',
             loginPassword:     s.loginPassword     || '',
             loginEmail:        s.loginEmail        || '',
@@ -668,22 +728,10 @@ module.exports = (db) => {
         };
       });
 
-      // ── Update account status → 'sold' (atomic, skip nếu đã done) ────
-      if (!statusAlreadyUpdated) {
-        await Promise.all(uniqueAccountIds.map(async (accountId) => {
-          try {
-            await db.update('accounts', accountId, { status: 'sold' });
-            console.log(`✅ account ${accountId} → sold`);
-          } catch (e) {
-            console.warn(`⚠️ Update status ${accountId}:`, e.message);
-          }
-        }));
-      }
-
-      // ── Ghi order với credentials đã inject ──────────────────────────
+      // ── Ghi order ────────────────────────────────────────────────────
       await db.update('orders', orderId, {
-        items:               updatedItems,
-        _statusUpdated:      true,
+        items:                updatedItems,
+        _soldCountUpdated:    true,
         _credentialsInjected: true,
       });
 
