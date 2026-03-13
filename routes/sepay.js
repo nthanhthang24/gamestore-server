@@ -640,74 +640,95 @@ module.exports = (db) => {
         }
       }));
 
-      // ── Atomic: increment soldCount + assign combo slots ──────────────
-      // Mỗi item trong order là 1 combo.
-      // combo index = soldCount trước khi bán → slotStart = comboIndex * quantity
+      // ── Atomic: increment soldCount per combo purchased ─────────────
+      // 1 order có thể có N combos của cùng 1 item (user mua qty > 1)
+      // Mỗi combo = 1 lần increment soldCount + 1 slot assignment
       const soldCountAlreadyDone = !!order._soldCountUpdated;
       const firestore = db.getFirestore();
-      const assignedSlotsByAccountId = {}; // accountId → [slot, ...]
+
+      // Đếm số combo per accountId trong order
+      const comboCountByAccountId = {}; // accountId → số combo trong order này
+      for (const item of items) {
+        if (!item.id) continue;
+        comboCountByAccountId[item.id] = (comboCountByAccountId[item.id] || 0) + 1;
+      }
+
+      // assignedCombosByAccountId: accountId → [[slot,...], [slot,...], ...]
+      // Mỗi phần tử là 1 combo (mảng các accounts trong combo đó)
+      const assignedCombosByAccountId = {};
 
       if (soldCountAlreadyDone) {
-        // Re-inject: soldCount đã tăng, đọc lại để tính đúng combo index
+        // Re-inject: soldCount đã tăng N lần, đọc lại soldCount hiện tại
         console.log('ℹ️ soldCount already done, re-injecting credentials only');
         for (const accountId of uniqueAccountIds) {
+          const nCombos = comboCountByAccountId[accountId] || 1;
           try {
             const accDoc = await db.get('accounts', accountId);
-            const accData = accDoc.exists ? accDoc.data() : {};
-            const quantity   = accData.quantity  || 1;
-            const soldCount  = accData.soldCount  || 0;
-            // Combo đã bán là index = soldCount - 1 (vì đã increment rồi)
-            const comboIndex = Math.max(0, soldCount - 1);
-            const slotStart  = comboIndex * quantity;
-            const creds = credsByAccountId[accountId] || [];
-            assignedSlotsByAccountId[accountId] = Array.from({ length: quantity }, (_, i) =>
-              creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
-            );
+            const accData   = accDoc.exists ? accDoc.data() : {};
+            const quantity  = accData.quantity  || 1;
+            const soldCount = accData.soldCount  || 0;
+            const creds     = credsByAccountId[accountId] || [];
+            // Combos đã assign: indices [soldCount-nCombos .. soldCount-1]
+            assignedCombosByAccountId[accountId] = Array.from({ length: nCombos }, (_, ci) => {
+              const comboIndex = (soldCount - nCombos) + ci;
+              const slotStart  = Math.max(0, comboIndex) * quantity;
+              return Array.from({ length: quantity }, (__, i) =>
+                creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
+              );
+            });
           } catch (e) {
             console.warn(`⚠️ Re-fetch ${accountId}:`, e.message);
-            assignedSlotsByAccountId[accountId] = [];
+            assignedCombosByAccountId[accountId] = Array(comboCountByAccountId[accountId] || 1).fill([]);
           }
         }
       } else {
-        // Normal path: transaction tăng soldCount + tính combo index atomically
+        // Normal path: N sequential transactions per accountId (N = nCombos)
         for (const accountId of uniqueAccountIds) {
-          const creds = credsByAccountId[accountId] || [];
-          let assigned = [];
+          const nCombos = comboCountByAccountId[accountId] || 1;
+          const creds   = credsByAccountId[accountId] || [];
+          const combos  = [];
           try {
             const accRef = firestore.collection('accounts').doc(accountId);
-            await db.runTransactionWithRetry(async (tx) => {
-              const accSnap = await tx.get(accRef);
-              if (!accSnap.exists) throw new Error('not_found');
-              const accData   = accSnap.data();
-              const quantity  = accData.quantity  || 1;
-              const stock     = accData.stock     || 1;
-              const soldCount = accData.soldCount || 0;
-              if (soldCount >= stock) throw new Error('sold_out');
-              // Combo index = soldCount (0-based, trước khi increment)
-              const slotStart = soldCount * quantity;
-              assigned = Array.from({ length: quantity }, (_, i) =>
-                creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
-              );
-              const updateData = { soldCount: db.FieldValue.increment(1) };
-              if (soldCount + 1 >= stock) updateData.status = 'sold';
-              tx.update(accRef, updateData);
-            });
-            assignedSlotsByAccountId[accountId] = assigned;
-            console.log(`✅ soldCount +1: ${accountId}`);
+            for (let ci = 0; ci < nCombos; ci++) {
+              let assignedSlots = [];
+              await db.runTransactionWithRetry(async (tx) => {
+                const accSnap = await tx.get(accRef);
+                if (!accSnap.exists) throw new Error('not_found');
+                const accData   = accSnap.data();
+                const quantity  = accData.quantity  || 1;
+                const stock     = accData.stock     || 1;
+                const soldCount = accData.soldCount || 0;
+                if (soldCount >= stock) throw new Error('sold_out');
+                const slotStart = soldCount * quantity;
+                assignedSlots = Array.from({ length: quantity }, (_, i) =>
+                  creds[slotStart + i] || { loginUsername:'', loginPassword:'', loginEmail:'', loginNote:'', attachmentContent:null, attachmentUrl:null, attachmentName:null }
+                );
+                const updateData = { soldCount: db.FieldValue.increment(1) };
+                if (soldCount + 1 >= stock) updateData.status = 'sold';
+                tx.update(accRef, updateData);
+              });
+              combos.push(assignedSlots);
+              console.log(`✅ soldCount +1 (combo ${ci+1}/${nCombos}): ${accountId}`);
+            }
+            assignedCombosByAccountId[accountId] = combos;
           } catch (e) {
             console.error(`❌ Transaction failed ${accountId}: ${e.message}`);
-            assignedSlotsByAccountId[accountId] = [];
+            // Fill remaining combos with empty slots
+            while (combos.length < nCombos) combos.push([]);
+            assignedCombosByAccountId[accountId] = combos;
           }
         }
       }
 
-      // ── Build updatedItems với credentials đầy đủ của combo ──────────
+      // ── Build updatedItems: assign combo sequentially per accountId ──
+      const comboOffsetByAccountId = {}; // accountId → next combo index
       const updatedItems = items.map(item => {
         if (!item.id) return item;
-        const slots = assignedSlotsByAccountId[item.id] || [];
+        const offset = comboOffsetByAccountId[item.id] || 0;
+        comboOffsetByAccountId[item.id] = offset + 1;
+        const slots = (assignedCombosByAccountId[item.id] || [])[offset] || [];
         return {
           ...item,
-          // slot[0] — backward compat
           loginUsername:     slots[0]?.loginUsername     || '',
           loginPassword:     slots[0]?.loginPassword     || '',
           loginEmail:        slots[0]?.loginEmail        || '',
@@ -715,7 +736,6 @@ module.exports = (db) => {
           attachmentContent: slots[0]?.attachmentContent || null,
           attachmentUrl:     slots[0]?.attachmentUrl     || null,
           attachmentName:    slots[0]?.attachmentName    || null,
-          // Tất cả accounts trong combo
           credentials: slots.map(s => ({
             loginUsername:     s.loginUsername     || '',
             loginPassword:     s.loginPassword     || '',
