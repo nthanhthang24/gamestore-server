@@ -486,7 +486,7 @@ module.exports = (db) => {
       const pending = await db.query('topups', [
         ['userId', '==', userId],
         ['status',  '==', 'pending'],
-      ], null, 5);
+      ], null, 5, serverToken);
       if (pending.length >= 3) {
         return res.status(429).json({ error: 'Bạn đang có 3 yêu cầu nạp tiền chưa xử lý.' });
       }
