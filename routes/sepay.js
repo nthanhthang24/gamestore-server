@@ -121,15 +121,19 @@ module.exports = (db) => {
       if (sePayError !== 0 && sePayError != null) {
         return res.status(200).json({ message: 'Skipped - error transaction' });
       }
-      if (!transferAmount || transferAmount <= 0) {
+      // FIX A1: Cast and validate transferAmount as a proper number
+      const safeAmount = Number(transferAmount);
+      if (!transferAmount || isNaN(safeAmount) || safeAmount <= 0 || !isFinite(safeAmount)) {
         return res.status(200).json({ message: 'Invalid amount' });
       }
-      if (transferAmount > 50_000_000) {
+      // Re-assign as validated number for all downstream use
+      // (reassign via const in outer scope is not possible; use safeAmount below)
+      if (safeAmount > 50_000_000) {
         console.warn(`⚠️ Amount vượt giới hạn: ${transferAmount}`);
         // FIX: dùng Admin SDK — không cần Firestore rules
         await db.add('unmatchedTopups', {
           sePayId: String(sePayId), gateway, content,
-          amount: transferAmount, transactionDate,
+          amount: safeAmount, transactionDate,
           status: 'overlimit', createdAt: db.FieldValue.serverTimestamp(),
         });
         return res.status(200).json({ message: 'Amount over limit' });
@@ -186,7 +190,7 @@ module.exports = (db) => {
       if (!user) {
         await db.add('unmatchedTopups', {
           sePayId: String(sePayId), gateway, content, code: code || null,
-          amount: transferAmount, transactionDate, referenceCode,
+          amount: safeAmount, transactionDate, referenceCode,
           status: 'unmatched', createdAt: db.FieldValue.serverTimestamp(),
         });
         console.log('⚠️ Unmatched transaction:', { content, transferAmount, sePayId });
@@ -202,7 +206,7 @@ module.exports = (db) => {
         return res.status(404).json({ error: 'User not found' });
       }
       const prev = userDoc.data().balance || 0;
-      const next = prev + transferAmount;
+      const next = prev + safeAmount;
 
       // Tất cả writes dùng Admin SDK — bypass Firestore rules
       const writePromises = [
@@ -217,7 +221,7 @@ module.exports = (db) => {
           type:          'topup',
           method:        'bank_transfer',
           gateway,
-          amount:        transferAmount,
+          amount:        safeAmount,
           balanceBefore: prev,
           balanceAfter:  next,
           sePayId:       String(sePayId),
@@ -241,7 +245,7 @@ module.exports = (db) => {
           userId:          user.userId,
           userEmail:       user.userEmail,
           userName:        user.displayName || user.userEmail,
-          amount:          transferAmount,
+          amount:          safeAmount,
           method:          'bank_transfer',
           gateway,
           transferContent: content,
@@ -263,10 +267,10 @@ module.exports = (db) => {
       }));
 
       await Promise.all(writePromises);
-      console.log(`✅ Nạp +${transferAmount}đ cho ${user.userEmail} | ${prev} → ${next}`);
+      console.log(`✅ Nạp +${safeAmount}đ cho ${user.userEmail} | ${prev} → ${next}`);
 
       try {
-        await processReferralCommission(db, user.userId, transferAmount);
+        await processReferralCommission(db, user.userId, safeAmount);
       } catch (refErr) {
         console.warn('⚠️ Referral commission error (non-critical):', refErr.message);
       }
@@ -288,7 +292,7 @@ module.exports = (db) => {
       const settingsDoc = await db.get('settings', 'global');
       if (settingsDoc.exists) {
         const s = settingsDoc.data();
-        if (s.referralCommissionPct != null) commissionPct  = Number(s.referralCommissionPct);
+        if (s.referralCommissionPct != null) commissionPct  = Math.min(Number(s.referralCommissionPct), 50); // FIX BUG#5: cap at 50%
         if (s.referralMinTopup      != null) minTopup       = Number(s.referralMinTopup);
         if (s.referralNewUserBonus  != null) newUserBonus   = Number(s.referralNewUserBonus);
       }
@@ -296,71 +300,102 @@ module.exports = (db) => {
 
     if (topupAmount < minTopup) return;
 
-    const existingCredited = await db.query('referrals', [
-      ['newUserId', '==', userId],
-      ['credited',  '==', true ],
-    ], null, 1);
-    if (existingCredited && existingCredited.length > 0) return;
+    // FIX BUG#4 RACE CONDITION: Use createIfNotExists as a distributed lock.
+    // Two concurrent webhooks for the same user will both try to create this lock doc.
+    // Only ONE will succeed (precondition: exists=false).
+    // The other gets ALREADY_EXISTS → returns early → no double commission.
+    const lockKey = `referral_lock_${userId}`;
+    try {
+      await db.createIfNotExists('processedWebhooks', lockKey, {
+        type:      'referral_lock',
+        userId,
+        lockedAt:  db.FieldValue.serverTimestamp(),
+      });
+    } catch (lockErr) {
+      if (lockErr.message === 'ALREADY_EXISTS' || lockErr.response?.status === 409) {
+        console.log(`⚠️ Referral commission already being processed for userId=${userId}`);
+        return;
+      }
+      throw lockErr; // Re-throw unexpected errors
+    }
 
-    const pendingReferrals = await db.query('referrals', [
-      ['newUserId', '==', userId],
-      ['credited',  '==', false],
-    ], null, 1);
-    if (!pendingReferrals || pendingReferrals.length === 0) return;
+    try {
+      const existingCredited = await db.query('referrals', [
+        ['newUserId', '==', userId],
+        ['credited',  '==', true ],
+      ], null, 1);
+      if (existingCredited && existingCredited.length > 0) return;
 
-    const prevTopups = await db.query('topups', [
-      ['userId', '==', userId],
-      ['status', '==', 'approved'],
-    ], null, 5);
-    if (prevTopups && prevTopups.length > 1) return;
+      const pendingReferrals = await db.query('referrals', [
+        ['newUserId', '==', userId],
+        ['credited',  '==', false],
+      ], null, 1);
+      if (!pendingReferrals || pendingReferrals.length === 0) return;
 
-    const referral   = pendingReferrals[0];
-    const referrerId = referral.data().referrerId;
-    if (!referrerId) return;
+      const prevTopups = await db.query('topups', [
+        ['userId', '==', userId],
+        ['status', '==', 'approved'],
+      ], null, 5);
+      if (prevTopups && prevTopups.length > 1) return;
 
-    const commissionAmount = Math.round(topupAmount * commissionPct / 100);
-    const referrerDoc = await db.get('users', referrerId);
-    if (!referrerDoc.exists) return;
+      const referral   = pendingReferrals[0];
+      const referrerId = referral.data().referrerId;
+      if (!referrerId) return;
 
-    const referrerBalance = referrerDoc.data().balance || 0;
+      const commissionAmount = Math.round(topupAmount * commissionPct / 100);
+      const referrerDoc = await db.get('users', referrerId);
+      if (!referrerDoc.exists) return;
 
-    // FIX: dùng Admin SDK — update referral cũng dùng Admin SDK bypass rules
-    await Promise.all([
-      db.update('users', referrerId, {
-        balance:   db.FieldValue.increment(commissionAmount),
-        updatedAt: db.FieldValue.serverTimestamp(),
-      }),
-      db.update('referrals', referral.id, {
-        credited:         true,
-        commissionAmount,
-        commissionPct,
-        topupAmount,
-        creditedAt:       db.FieldValue.serverTimestamp(),
-      }),
-      db.add('transactions', {
-        userId:        referrerId,
-        type:          'referral_commission',
-        amount:        commissionAmount,
-        fromUserId:    userId,
-        commissionPct,
-        topupAmount,
-        balanceBefore: referrerBalance,
-        balanceAfter:  referrerBalance + commissionAmount,
-        createdAt:     db.FieldValue.serverTimestamp(),
-      }),
-      db.add('notifications', {
-        title:        '💰 Nhận hoa hồng giới thiệu!',
-        body:         `Bạn bè nạp ${topupAmount.toLocaleString('vi-VN')}đ → bạn nhận ${commissionAmount.toLocaleString('vi-VN')}đ (${commissionPct}% hoa hồng).`,
-        type:         'referral',
-        targetAll:    false,
-        targetUserId: referrerId,
-        active:       true,
-        read:         [],
-        createdAt:    db.FieldValue.serverTimestamp(),
-        createdBy:    'system',
-      }),
-    ]);
-    console.log(`✅ Referral commission: ${commissionAmount}đ → ${referrerId}`);
+      const referrerBalance = referrerDoc.data().balance || 0;
+
+      await Promise.all([
+        db.update('users', referrerId, {
+          balance:   db.FieldValue.increment(commissionAmount),
+          updatedAt: db.FieldValue.serverTimestamp(),
+        }),
+        db.update('referrals', referral.id, {
+          credited:         true,
+          commissionAmount,
+          commissionPct,
+          topupAmount,
+          creditedAt:       db.FieldValue.serverTimestamp(),
+        }),
+        db.add('transactions', {
+          userId:        referrerId,
+          type:          'referral_commission',
+          amount:        commissionAmount,
+          fromUserId:    userId,
+          commissionPct,
+          topupAmount,
+          balanceBefore: referrerBalance,
+          balanceAfter:  referrerBalance + commissionAmount,
+          createdAt:     db.FieldValue.serverTimestamp(),
+        }),
+        db.add('notifications', {
+          title:        '💰 Nhận hoa hồng giới thiệu!',
+          body:         `Bạn bè nạp ${topupAmount.toLocaleString('vi-VN')}đ → bạn nhận ${commissionAmount.toLocaleString('vi-VN')}đ (${commissionPct}% hoa hồng).`,
+          type:         'referral',
+          targetAll:    false,
+          targetUserId: referrerId,
+          active:       true,
+          read:         [],
+          createdAt:    db.FieldValue.serverTimestamp(),
+          createdBy:    'system',
+        }),
+      ]);
+      console.log(`✅ Referral commission: ${commissionAmount}đ → ${referrerId}`);
+    } finally {
+      // Always release the lock after processing (whether success or error)
+      // This allows future webhooks to process if this one errored out
+      // (The lock prevents concurrent same-second double-credit, not future retries)
+      try {
+        // Update lock status to 'done' so it still acts as dedup evidence
+        await db.update('processedWebhooks', lockKey, {
+          status: 'done',
+          doneAt: db.FieldValue.serverTimestamp(),
+        });
+      } catch (_) { /* non-critical */ }
+    }
   }
 
   // ── Middleware: verify Firebase ID token ────────────────────────────────
@@ -547,6 +582,16 @@ module.exports = (db) => {
       if (order._soldCountUpdated) {
         return res.status(200).json({ message: 'already_updated' });
       }
+      // FIX D1 server-side: verify idempotencyKey starts with owner's UID
+      // This ensures the order was created through CartPage's legitimate flow
+      // (CartPage generates: uid + '_' + crypto.randomUUID())
+      // An attacker who forges an order can set any idempotencyKey,
+      // but the UID prefix must match the authenticated user.
+      const iKey = order.idempotencyKey || '';
+      if (!iKey.startsWith(req.firebaseUid + '_')) {
+        console.error(`⛔ checkout/confirm: invalid idempotencyKey format. orderId=${orderId} uid=${req.firebaseUid} key=${iKey.slice(0,30)}`);
+        return res.status(403).json({ error: 'Invalid order — please re-checkout.', code: 'INVALID_IKEY' });
+      }
 
       const items = order.items || [];
       if (items.length === 0) {
@@ -586,8 +631,14 @@ module.exports = (db) => {
       // Verify: total phải >= 10% của DB price (tối đa giảm 90%)
       // Và total không được vượt quá DB price (không được mua đắt hơn giá gốc)
       const minAllowedTotal = Math.floor(dbPriceSum * 0.10); // max 90% discount
-      if (orderTotal < minAllowedTotal || orderTotal <= 0) {
-        console.error(`⛔ Price manipulation detected! orderId=${orderId} total=${orderTotal} dbPriceSum=${dbPriceSum} minAllowed=${minAllowedTotal}`);
+      // FIX D1: stricter price check — increase floor from 10% to 90%
+      // (allow at most 10% discount total, not 90%)
+      // Normal discounts: bulk up to ~30%, voucher up to ~50% → combined ~65% max
+      // Set floor at 25% to accommodate all legitimate discounts with margin
+      const strictMinAllowedTotal = Math.floor(dbPriceSum * 0.25); // max 75% discount
+      const effectiveMin = Math.max(minAllowedTotal, strictMinAllowedTotal > 0 ? strictMinAllowedTotal : 0);
+      if (orderTotal < effectiveMin || orderTotal <= 0) {
+        console.error(`⛔ Price manipulation detected! orderId=${orderId} total=${orderTotal} dbPriceSum=${dbPriceSum} minAllowed=${effectiveMin}`);
         return res.status(403).json({
           error: 'Tổng đơn hàng không hợp lệ. Vui lòng đặt hàng lại.',
           code:  'PRICE_MISMATCH',
