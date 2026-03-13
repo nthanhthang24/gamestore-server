@@ -212,7 +212,7 @@ module.exports = (db) => {
       const writePromises = [
         // FIX V1: Admin SDK update — không phụ thuộc rule !isAuthenticated()
         db.update('users', user.userId, {
-          balance:   db.FieldValue.increment(transferAmount), // atomic
+          balance:   db.FieldValue.increment(safeAmount), // FIX A1: use validated safeAmount
           updatedAt: db.FieldValue.serverTimestamp(),
         }),
         db.add('transactions', {
@@ -262,7 +262,7 @@ module.exports = (db) => {
       writePromises.push(db.update('processedWebhooks', String(sePayId), {
         status:      'done',
         userId:      user.userId,
-        amount:      transferAmount,
+        amount:      safeAmount,   // FIX A1: use validated safeAmount
         processedAt: db.FieldValue.serverTimestamp(),
       }));
 
@@ -763,8 +763,12 @@ module.exports = (db) => {
       return res.status(200).json({ message: 'success' });
 
     } catch (err) {
-      console.error('❌ /checkout/confirm error:', err.message);
-      return res.status(500).json({ error: 'Internal server error' });
+      console.error('❌ /checkout/confirm error:', err.message, err.stack?.split('\n')[1] || '');
+      // Return actual error message in dev, generic in prod
+      const msg = process.env.NODE_ENV === 'production'
+        ? 'Internal server error'
+        : (err.message || 'Internal server error');
+      return res.status(500).json({ error: msg });
     }
   });
 
