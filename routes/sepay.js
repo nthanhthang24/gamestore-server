@@ -459,6 +459,13 @@ module.exports = (db) => {
       return res.status(403).json({ error: 'userId không khớp với token' });
     }
 
+    // Lấy serverToken để gọi Firestore (topups create cần isServer())
+    const serverToken = await db.getServerBotToken();
+    if (!serverToken) {
+      console.error('⛔ Server bot token không khả dụng');
+      return res.status(503).json({ error: 'Server chưa được cấu hình đúng' });
+    }
+
     const amt = Number(amount);
     if (isNaN(amt) || amt < 10000 || amt > 50_000_000)
       return res.status(400).json({ error: 'Số tiền phải từ 10,000 đến 50,000,000đ' });
@@ -470,7 +477,7 @@ module.exports = (db) => {
 
     // Validate user
     try {
-      const userDoc = await db.get('users', userId);
+      const userDoc = await db.get('users', userId, serverToken);
       if (userDoc.exists) {
         const storedEmail = userDoc.data().email;
         if (storedEmail && storedEmail !== decodeURIComponent(userEmail)) {
@@ -510,7 +517,7 @@ module.exports = (db) => {
         status:          'pending',
         transferContent: content,
         createdAt:       db.FieldValue.serverTimestamp(),
-      });
+      }, serverToken);
 
       const qrAcc = BANK.va || BANK.acc;
       if (!BANK.va) console.warn('⚠️ BANK_VA_NUMBER chưa set!');
