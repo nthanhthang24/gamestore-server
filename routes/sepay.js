@@ -743,11 +743,13 @@ module.exports = (db) => {
           try {
             const accDoc = await db.get('accounts', accountId);
             const accData  = accDoc.exists ? accDoc.data() : {};
-            const quantity = accData.quantity || 1;
+            const totalSlots = accData.quantity || 1;
             const soldCount  = accData.soldCount || 1;
-            const slotStart  = (soldCount - 1) * quantity;
+            const buyQty = items.filter(i => i.id === accountId).length;
+            // Khi retry: slot đã được assign từ lần trước, tính ngược lại
+            const slotStart  = soldCount - buyQty;
             const assignedSlots = [];
-            for (let i = 0; i < quantity; i++) {
+            for (let i = 0; i < buyQty; i++) {
               assignedSlots.push(creds[slotStart + i] || {
                 loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
                 attachmentContent: null, attachmentName: null,
@@ -786,17 +788,24 @@ module.exports = (db) => {
               if (!accSnap.exists) throw new Error('not_found');
 
               const accData          = accSnap.data();
-              const quantity         = accData.quantity || 1;
+              const totalSlots       = accData.quantity || 1;
               const currentSoldCount = accData.soldCount || 0;
+              // buyQty = số slot user đặt mua cho account này (từ order.items)
+              const buyQty = items.filter(i => i.id === accountId).length;
 
-              if (currentSoldCount >= 1) {
+              const remaining = totalSlots - currentSoldCount;
+              if (remaining <= 0) {
                 throw new Error('sold_out');
               }
+              if (buyQty > remaining) {
+                throw new Error(`not_enough_stock:${remaining}`);
+              }
 
-              // Assign credential slots trong transaction — đảm bảo chỉ 1 người nhận
-              const slotStart = currentSoldCount * quantity;
+              // Assign buyQty slots liên tiếp — KHÔNG trùng với người khác
+              // vì transaction lock doc này, người khác phải đợi
+              const slotStart = currentSoldCount; // mỗi slot là 1 credentials riêng
               assignedSlots = [];
-              for (let i = 0; i < quantity; i++) {
+              for (let i = 0; i < buyQty; i++) {
                 assignedSlots.push(creds[slotStart + i] || {
                   loginUsername: '', loginPassword: '',
                   loginEmail: '', loginNote: '',
@@ -804,9 +813,11 @@ module.exports = (db) => {
                 });
               }
 
+              const newSoldCount = currentSoldCount + buyQty;
               tx.update(accRef, {
-                soldCount: db.FieldValue.increment(1),
-                status: 'sold',
+                soldCount: db.FieldValue.increment(buyQty),
+                // status='sold' chỉ khi đã bán hết tất cả slots
+                status: newSoldCount >= totalSlots ? 'sold' : 'available',
               });
             }, 3, serverToken);
 
@@ -814,36 +825,40 @@ module.exports = (db) => {
             console.log(`✅ soldCount +1, status=sold (atomic tx), injecting ${assignedSlots.length} slots: ${accountId}`);
           } catch (e) {
             console.error(`❌ Transaction failed for ${accountId}: ${e.message}`);
+            if (e.message === 'sold_out') throw new Error(`Sản phẩm vừa hết hàng.`);
+            if (e.message.startsWith('not_enough_stock:')) {
+              const rem = e.message.split(':')[1];
+              throw new Error(`Chỉ còn ${rem} slot, vui lòng điều chỉnh số lượng.`);
+            }
             throw new Error(`Không thể cập nhật trạng thái sản phẩm ${accountId}: ${e.message}`);
           }
         }
       }
 
+      // Mỗi item trong order = 1 slot riêng biệt
+      // slotsByAccountId[accountId] = mảng buyQty slots đã assign
+      // Phân phát từng slot cho từng item theo thứ tự
+      const slotIndexByAccountId = {};
       const updatedItems = items.map(item => {
         if (!item.id || !slotsByAccountId[item.id]) return item;
         const slots = slotsByAccountId[item.id];
-        const first = slots[0] || {
+        // Lấy slot theo thứ tự — mỗi item trong order nhận 1 slot riêng
+        const idx = slotIndexByAccountId[item.id] || 0;
+        slotIndexByAccountId[item.id] = idx + 1;
+        const s = slots[idx] || {
           loginUsername: '', loginPassword: '', loginEmail: '', loginNote: '',
           attachmentContent: null, attachmentUrl: null, attachmentName: null,
         };
         return {
           ...item,
-          loginUsername:     first.loginUsername     || '',
-          loginPassword:     first.loginPassword     || '',
-          loginEmail:        first.loginEmail        || '',
-          loginNote:         first.loginNote         || '',
-          attachmentContent: first.attachmentContent || null,
-          attachmentUrl:     first.attachmentUrl     || null,
-          attachmentName:    first.attachmentName    || null,
-          allCredentials: slots.map(s => ({
-            loginUsername:     s.loginUsername     || '',
-            loginPassword:     s.loginPassword     || '',
-            loginEmail:        s.loginEmail        || '',
-            loginNote:         s.loginNote         || '',
-            attachmentContent: s.attachmentContent || null,
-            attachmentUrl:     s.attachmentUrl     || null,
-            attachmentName:    s.attachmentName    || null,
-          })),
+          loginUsername:     s.loginUsername     || '',
+          loginPassword:     s.loginPassword     || '',
+          loginEmail:        s.loginEmail        || '',
+          loginNote:         s.loginNote         || '',
+          attachmentContent: s.attachmentContent || null,
+          attachmentUrl:     s.attachmentUrl     || null,
+          attachmentName:    s.attachmentName    || null,
+          slotIndex:         idx, // để debug
         };
       });
 
