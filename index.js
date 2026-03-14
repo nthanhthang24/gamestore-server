@@ -83,6 +83,7 @@ app.use('/bank', require('./routes/sepay')(db));
 
 // ── Debug bot (trước 404/error handler) ──────────────────────────────────
 app.get('/debug/bot', (req, res) => {
+  if (req.query.key !== process.env.SEPAY_API_KEY) return res.status(403).json({ error: 'forbidden' });
   res.setHeader('Content-Type', 'application/json');
   const email = process.env.SERVER_BOT_EMAIL || '(not set)';
   const hasPass = !!process.env.SERVER_BOT_PASSWORD;
