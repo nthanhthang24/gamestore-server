@@ -77,17 +77,40 @@ app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 
 // ── Debug: kiểm tra server bot credentials ────────────────────────────────
 app.get('/debug/bot', async (_req, res) => {
-  const db = require('./lib/firestore');
+  // Bypass error handler — trả về lỗi thật
+  res.setHeader('Content-Type', 'application/json');
   const email   = process.env.SERVER_BOT_EMAIL    || '(not set)';
   const hasPass = !!process.env.SERVER_BOT_PASSWORD;
+  const pass4   = (process.env.SERVER_BOT_PASSWORD || '').slice(-4); // last 4 chars để verify
   try {
-    const token = await db.getServerBotToken();
-    if (!token) return res.json({ ok: false, email, hasPass, error: 'getServerBotToken() returned null — sign-in failed, check email/password' });
-    // Test đọc Firestore bằng token này
-    const snap = await db.get('settings', 'global', token);
-    return res.json({ ok: true, email, hasPass, tokenOk: true, settingsExists: snap.exists });
+    const db = require('./lib/firestore');
+    let token = null;
+    let signInError = null;
+    try {
+      token = await db.getServerBotToken();
+    } catch(e) {
+      signInError = e.message;
+    }
+    if (!token) {
+      return res.end(JSON.stringify({ ok: false, email, hasPass, pass4, signInError: signInError || 'returned null' }));
+    }
+    // Decode JWT để xem uid + exp
+    const parts = token.split('.');
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    const uid = payload.user_id || payload.sub;
+    const exp = new Date(payload.exp * 1000).toISOString();
+
+    // Test write vào topups
+    let writeOk = false, writeError = null;
+    try {
+      await db.set('topups', '_debug_test_', { test: true, at: db.FieldValue.serverTimestamp() }, token);
+      writeOk = true;
+      await db.batch([{ type: 'delete', collection: 'topups', docId: '_debug_test_' }], token);
+    } catch(e) { writeError = e.message; }
+
+    return res.end(JSON.stringify({ ok: writeOk, email, uid, exp, writeOk, writeError }));
   } catch(e) {
-    return res.json({ ok: false, email, hasPass, error: e.message });
+    return res.end(JSON.stringify({ ok: false, email, hasPass, pass4, fatalError: e.message, stack: e.stack?.split('\n').slice(0,3) }));
   }
 });
 
