@@ -5,9 +5,17 @@ const helmet  = require('helmet');
 
 const app = express();
 
-// ── Health / ping — TRƯỚC mọi middleware (không cần Origin) ──────────────
-app.get('/', (_req, res) => res.status(200).json({ ok: true }));
+// ── Health / ping — TRƯỚC mọi middleware ─────────────────────────────────
+app.get('/',       (_req, res) => res.status(200).json({ ok: true }));
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+app.head('/',      (_req, res) => res.status(200).end());
+
+// ── Suppress CORS errors for requests with no Origin (Render health monitor)
+// These are server-to-server pings — safe to allow, no credentials involved
+app.use((req, _res, next) => {
+  if (!req.headers.origin) req.skipCors = true;
+  next();
+});
 
 
 // ── FIX V18: Helmet — bổ sung HSTS, Referrer-Policy, CSP và các security headers ──
@@ -42,10 +50,7 @@ const VERCEL_PROJECT_NAMES = (process.env.VERCEL_PROJECT_NAMES || 'gamestore-cli
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 function isAllowedOrigin(origin) {
-  // SECURITY: null origin (file://, sandboxed iframe) phải bị chặn
-  // Chỉ server-to-server (webhook từ SePay) mới không có origin → nhưng webhook
-  // đi qua /bank/webhook có verifyWebhook middleware riêng (API key) → không cần CORS bypass
-  if (!origin) return false;
+  if (!origin) return false; // no-origin handled separately above
   if (allowedOrigins.includes(origin)) return true;
   if (allowedOrigins.length === 0 && process.env.NODE_ENV !== 'production') return true;
   // Allow all Vercel deployments for configured project names
@@ -58,13 +63,17 @@ function isAllowedOrigin(origin) {
   return false;
 }
 
-app.use(cors({
-  origin: (origin, callback) => {
-    if (isAllowedOrigin(origin)) return callback(null, true);
-    callback(new Error('CORS: origin not allowed - ' + origin));
-  },
-  credentials: true,
-}));
+app.use((req, res, next) => {
+  // No-origin requests (Render health monitor, server-to-server): skip CORS entirely
+  if (!req.headers.origin) return next();
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) return callback(null, true);
+      callback(new Error('CORS: origin not allowed - ' + origin));
+    },
+    credentials: true,
+  })(req, res, next);
+});
 
 // ── Trust proxy (Render.com: 1 hop) ─────────────────────────────────────
 app.set('trust proxy', 1);
@@ -81,36 +90,6 @@ app.disable('x-powered-by');
 const db = require('./lib/firestore');
 app.use('/bank', require('./routes/sepay')(db));
 
-// ── Debug bot — logs to Render console, returns plain text ──────────────
-app.get('/debug/bot', (req, res) => {
-  if (req.query.key !== process.env.SEPAY_API_KEY) return res.status(403).end('forbidden');
-  const email = process.env.SERVER_BOT_EMAIL || '(not set)';
-  const pass4 = (process.env.SERVER_BOT_PASSWORD || '').slice(-4);
-  console.log('[DEBUG/BOT] starting, email=' + email + ' pass4=' + pass4);
-  db.getServerBotToken()
-    .then(function(token) {
-      if (!token) {
-        console.log('[DEBUG/BOT] token=null, sign-in failed');
-        return res.end('token=null email=' + email + ' pass4=' + pass4);
-      }
-      var uid = '?';
-      try { uid = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).user_id; } catch(_) {}
-      console.log('[DEBUG/BOT] token OK uid=' + uid);
-      db.set('topups', '_dbg_', { t: 1 }, token)
-        .then(function() {
-          console.log('[DEBUG/BOT] write OK');
-          res.end('OK uid=' + uid + ' write=OK');
-        })
-        .catch(function(we) {
-          console.log('[DEBUG/BOT] write FAIL: ' + we.message);
-          res.end('OK uid=' + uid + ' write=FAIL: ' + we.message);
-        });
-    })
-    .catch(function(e) {
-      console.log('[DEBUG/BOT] getServerBotToken threw: ' + e.message);
-      res.end('ERROR: ' + e.message);
-    });
-});
 
 // ── 404 handler ───────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
