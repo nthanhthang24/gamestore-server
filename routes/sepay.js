@@ -858,25 +858,31 @@ module.exports = (db) => {
           attachmentContent: s.attachmentContent || null,
           attachmentUrl:     s.attachmentUrl     || null,
           attachmentName:    s.attachmentName    || null,
-          slotIndex:         idx, // để debug
         };
       });
 
       // Update order dùng userToken (rules cho phép user update order của họ)
-      await db.update('orders', orderId, {
+      console.log(`📝 Updating order ${orderId} with ${updatedItems.length} items...`);
+      const updatePayload = {
         items:               updatedItems,
         _soldCountUpdated:   true,
         _credentialsInjected: true,
-      }, userToken);
+      };
+      // Check payload size trước khi gửi
+      const payloadSize = JSON.stringify(updatePayload).length;
+      console.log(`📦 Order update payload size: ${payloadSize} chars`);
+      if (payloadSize > 900000) {
+        console.error('⛔ Payload quá lớn:', payloadSize);
+        throw new Error('Order data too large (>900KB). Please contact admin.');
+      }
+      await db.update('orders', orderId, updatePayload, userToken);
 
       return res.status(200).json({ message: 'success' });
 
     } catch (err) {
-      console.error('❌ /checkout/confirm error:', err.message, err.stack?.split('\n')[1] || '');
-      const msg = process.env.NODE_ENV === 'production'
-        ? 'Internal server error'
-        : (err.message || 'Internal server error');
-      return res.status(500).json({ error: msg });
+      console.error('❌ /checkout/confirm error:', err.message, err.stack?.split('\n').slice(0,3).join(' | ') || '');
+      // Trả về error thật để debug (sẽ ẩn lại sau khi fix)
+      return res.status(500).json({ error: err.message || 'Internal server error' });
     }
   });
 
