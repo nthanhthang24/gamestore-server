@@ -81,29 +81,35 @@ app.disable('x-powered-by');
 const db = require('./lib/firestore');
 app.use('/bank', require('./routes/sepay')(db));
 
-// ── Debug bot ────────────────────────────────────────────────────────────
-app.get('/debug/bot', async (req, res) => {
-  if (req.query.key !== process.env.SEPAY_API_KEY) return res.status(403).json({ error: 'forbidden' });
-  const result = {
-    email:   process.env.SERVER_BOT_EMAIL    || '(not set)',
-    hasPass: !!process.env.SERVER_BOT_PASSWORD,
-    pass4:   (process.env.SERVER_BOT_PASSWORD || '').slice(-4),
-    node:    process.version,
-  };
-  try {
-    const token = await db.getServerBotToken();
-    if (!token) { result.step = 'no_token'; return res.json(result); }
-    const p = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
-    result.uid = p.user_id || p.sub;
-    result.exp = new Date(p.exp * 1000).toISOString();
-    result.tokenOk = true;
-    try {
-      await db.set('topups', '_dbg_', { t: db.FieldValue.serverTimestamp() }, token);
-      await db.batch([{ type:'delete', collection:'topups', docId:'_dbg_' }], token).catch(()=>{});
-      result.write = 'OK';
-    } catch(we) { result.write = 'FAIL'; result.writeError = we.message; }
-    return res.json(result);
-  } catch(e) { result.fatalError = e.message; return res.json(result); }
+// ── Debug bot — logs to Render console, returns plain text ──────────────
+app.get('/debug/bot', (req, res) => {
+  if (req.query.key !== process.env.SEPAY_API_KEY) return res.status(403).end('forbidden');
+  const email = process.env.SERVER_BOT_EMAIL || '(not set)';
+  const pass4 = (process.env.SERVER_BOT_PASSWORD || '').slice(-4);
+  console.log('[DEBUG/BOT] starting, email=' + email + ' pass4=' + pass4);
+  db.getServerBotToken()
+    .then(function(token) {
+      if (!token) {
+        console.log('[DEBUG/BOT] token=null, sign-in failed');
+        return res.end('token=null email=' + email + ' pass4=' + pass4);
+      }
+      var uid = '?';
+      try { uid = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).user_id; } catch(_) {}
+      console.log('[DEBUG/BOT] token OK uid=' + uid);
+      db.set('topups', '_dbg_', { t: 1 }, token)
+        .then(function() {
+          console.log('[DEBUG/BOT] write OK');
+          res.end('OK uid=' + uid + ' write=OK');
+        })
+        .catch(function(we) {
+          console.log('[DEBUG/BOT] write FAIL: ' + we.message);
+          res.end('OK uid=' + uid + ' write=FAIL: ' + we.message);
+        });
+    })
+    .catch(function(e) {
+      console.log('[DEBUG/BOT] getServerBotToken threw: ' + e.message);
+      res.end('ERROR: ' + e.message);
+    });
 });
 
 // ── 404 handler ───────────────────────────────────────────────────────────
