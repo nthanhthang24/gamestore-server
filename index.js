@@ -75,6 +75,22 @@ app.disable('x-powered-by');
 app.get('/', (_req, res) => res.status(200).json({ ok: true }));
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 
+// ── Debug: kiểm tra server bot credentials ────────────────────────────────
+app.get('/debug/bot', async (_req, res) => {
+  const db = require('./lib/firestore');
+  const email   = process.env.SERVER_BOT_EMAIL    || '(not set)';
+  const hasPass = !!process.env.SERVER_BOT_PASSWORD;
+  try {
+    const token = await db.getServerBotToken();
+    if (!token) return res.json({ ok: false, email, hasPass, error: 'getServerBotToken() returned null — sign-in failed, check email/password' });
+    // Test đọc Firestore bằng token này
+    const snap = await db.get('settings', 'global', token);
+    return res.json({ ok: true, email, hasPass, tokenOk: true, settingsExists: snap.exists });
+  } catch(e) {
+    return res.json({ ok: false, email, hasPass, error: e.message });
+  }
+});
+
 // ── Routes ────────────────────────────────────────────────────────────────
 const db = require('./lib/firestore');
 app.use('/bank', require('./routes/sepay')(db));
