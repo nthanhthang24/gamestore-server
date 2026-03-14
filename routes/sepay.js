@@ -285,6 +285,7 @@ module.exports = (db) => {
 
   // ── Referral Commission ───────────────────────────────────────────────
   async function processReferralCommission(db, userId, topupAmount, serverToken) {
+    return; // Referral system disabled
     let commissionPct  = 2;
     let minTopup       = 50000;
     let newUserBonus   = 10000;

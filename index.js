@@ -71,12 +71,13 @@ app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 // ── Remove fingerprinting ─────────────────────────────────────────────────
 app.disable('x-powered-by');
 
+// ── Health check — TRƯỚC CORS (Render monitor không gửi Origin header) ──
+app.get('/', (_req, res) => res.status(200).json({ ok: true }));
+app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+
 // ── Routes ────────────────────────────────────────────────────────────────
 const db = require('./lib/firestore');
 app.use('/bank', require('./routes/sepay')(db));
-
-// Health check
-app.get('/', (_req, res) => res.status(200).json({ ok: true }));
 
 // ── 404 handler ───────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
