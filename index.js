@@ -5,6 +5,11 @@ const helmet  = require('helmet');
 
 const app = express();
 
+// ── Health / ping — TRƯỚC mọi middleware (không cần Origin) ──────────────
+app.get('/', (_req, res) => res.status(200).json({ ok: true }));
+app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+
+
 // ── FIX V18: Helmet — bổ sung HSTS, Referrer-Policy, CSP và các security headers ──
 app.use(helmet({
   // HSTS: bắt buộc HTTPS trong 1 năm, bao gồm subdomain
@@ -70,11 +75,6 @@ app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
 // ── Remove fingerprinting ─────────────────────────────────────────────────
 app.disable('x-powered-by');
-
-// ── Health check — TRƯỚC CORS (Render monitor không gửi Origin header) ──
-app.get('/', (_req, res) => res.status(200).json({ ok: true }));
-app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
-
 
 
 // ── Routes ────────────────────────────────────────────────────────────────
