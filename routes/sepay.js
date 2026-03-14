@@ -733,7 +733,6 @@ module.exports = (db) => {
       }));
 
       // ── Atomic soldCount + credential slot assignment dùng serverToken ────
-      const firestore = db.getFirestore();
       const slotsByAccountId = {};
 
       if (soldCountAlreadyDone) {
@@ -773,37 +772,32 @@ module.exports = (db) => {
           }
         }
       } else {
-        // Dùng Firestore transaction với serverToken.
-        // Firestore rules cho phép isAdminOrServer() update soldCount/status → beginTransaction OK.
-        // Transaction đảm bảo atomicity: 2 người mua cùng lúc → chỉ 1 người thành công.
+        // Dùng optimistic locking thay vì Firestore REST transaction
+        // (beginTransaction với Firebase ID token không hoạt động ổn định qua REST API)
+        // Cơ chế: đọc doc → check → update với precondition updateTime
+        // Nếu doc thay đổi trong khi xử lý → CONFLICT → retry
         for (const accountId of Object.keys(deltaByAccountId)) {
           const creds = (accountDataById[accountId] && accountDataById[accountId].creds) || [];
           let assignedSlots = [];
+          const maxRetries = 5;
 
-          try {
-            const accRef = firestore.collection('accounts').doc(accountId);
+          for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+              // Đọc doc mới nhất
+              const accDoc = await db.get('accounts', accountId, serverToken);
+              if (!accDoc.exists) throw new Error('not_found');
 
-            await db.runTransactionWithRetry(async (tx) => {
-              const accSnap = await tx.get(accRef);
-              if (!accSnap.exists) throw new Error('not_found');
-
-              const accData          = accSnap.data();
+              const accData          = accDoc.data();
               const totalSlots       = accData.quantity || 1;
               const currentSoldCount = accData.soldCount || 0;
-              // buyQty = số slot user đặt mua cho account này (từ order.items)
-              const buyQty = items.filter(i => i.id === accountId).length;
+              const buyQty           = items.filter(i => i.id === accountId).length;
+              const remaining        = totalSlots - currentSoldCount;
 
-              const remaining = totalSlots - currentSoldCount;
-              if (remaining <= 0) {
-                throw new Error('sold_out');
-              }
-              if (buyQty > remaining) {
-                throw new Error(`not_enough_stock:${remaining}`);
-              }
+              if (remaining <= 0)      throw new Error('sold_out');
+              if (buyQty > remaining)  throw new Error(`not_enough_stock:${remaining}`);
 
-              // Assign buyQty slots liên tiếp — KHÔNG trùng với người khác
-              // vì transaction lock doc này, người khác phải đợi
-              const slotStart = currentSoldCount; // mỗi slot là 1 credentials riêng
+              // Assign slots theo thứ tự hiện tại
+              const slotStart = currentSoldCount;
               assignedSlots = [];
               for (let i = 0; i < buyQty; i++) {
                 assignedSlots.push(creds[slotStart + i] || {
@@ -814,23 +808,36 @@ module.exports = (db) => {
               }
 
               const newSoldCount = currentSoldCount + buyQty;
-              tx.update(accRef, {
-                soldCount: db.FieldValue.increment(buyQty),
-                // status='sold' chỉ khi đã bán hết tất cả slots
-                status: newSoldCount >= totalSlots ? 'sold' : 'available',
-              });
-            }, 3, serverToken);
 
-            slotsByAccountId[accountId] = assignedSlots;
-            console.log(`✅ soldCount +1, status=sold (atomic tx), injecting ${assignedSlots.length} slots: ${accountId}`);
-          } catch (e) {
-            console.error(`❌ Transaction failed for ${accountId}: ${e.message}`);
-            if (e.message === 'sold_out') throw new Error(`Sản phẩm vừa hết hàng.`);
-            if (e.message.startsWith('not_enough_stock:')) {
-              const rem = e.message.split(':')[1];
-              throw new Error(`Chỉ còn ${rem} slot, vui lòng điều chỉnh số lượng.`);
+              // Update với precondition: updateTime phải khớp
+              // Nếu người khác đã mua trước → doc.updateTime thay đổi → CONFLICT → retry
+              await db.updateIf('accounts', accountId, {
+                soldCount: db.FieldValue.increment(buyQty),
+                status: newSoldCount >= totalSlots ? 'sold' : 'available',
+              }, accDoc.updateTime, serverToken);
+
+              // Thành công
+              slotsByAccountId[accountId] = assignedSlots;
+              console.log(`✅ soldCount +${buyQty} (optimistic lock attempt ${attempt+1}), injecting ${assignedSlots.length} slots: ${accountId}`);
+              break; // thoát retry loop
+
+            } catch (e) {
+              if (e.isConflict && attempt < maxRetries - 1) {
+                // Conflict: người khác vừa mua → đọc lại và retry
+                console.log(`🔄 Optimistic lock conflict for ${accountId}, retry ${attempt+1}/${maxRetries}`);
+                await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
+                continue;
+              }
+              // Lỗi thật
+              console.error(`❌ Update failed for ${accountId}: ${e.message}`);
+              if (e.message === 'sold_out')                throw new Error(`Sản phẩm vừa hết hàng.`);
+              if (e.message === 'not_found')               throw new Error(`Sản phẩm không tồn tại.`);
+              if (e.message.startsWith('not_enough_stock:')) {
+                const rem = e.message.split(':')[1];
+                throw new Error(`Chỉ còn ${rem} slot, vui lòng điều chỉnh số lượng.`);
+              }
+              throw new Error(`Không thể cập nhật sản phẩm ${accountId}: ${e.message}`);
             }
-            throw new Error(`Không thể cập nhật trạng thái sản phẩm ${accountId}: ${e.message}`);
           }
         }
       }
